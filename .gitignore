@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+packaging_factory.db
+chroma_db/
+chroma_db/chroma.sqlite3
+data/ai4i2020.csv
