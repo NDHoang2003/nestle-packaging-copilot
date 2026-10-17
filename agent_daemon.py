@@ -1,320 +1,189 @@
-#!/usr/bin/env python3
 """
-================================================================================
-NESTLE DONG NAI FACTORY - INDUSTRIAL PACKAGING DIGITAL TWIN
-Module: Autonomous Watchdog Agent Daemon (Fast-Path Handshake Edition)
-Mechanism:
-  - Uses diagnose_incident_fast (Single-Shot Zero-Tool) -> 1.2s response time!
-  - 100% immune to 429 Rate Limits and 503 Overloads.
-  - Automatically records Downtime Events & generates P1_URGENT Work Orders.
-  - Releases Simulator via Bi-directional Handshake.
-Author: Nguyen Doan Hoang (Digital Technical Specialist Candidate)
-Reviewed by: Lead Industrial Data & AI Engineer
-================================================================================
+agent_daemon.py
+---------------
+Autonomous Closed-Loop Industrial Daemon for Nestle Dong Nai Packaging Lines.
+Orchestrates Degradation Engine, PLC Holding Registers, SAP PM Inventory, and ROI Ledger.
+
+Standards:
+- ISO 13374 Condition Monitoring / Diagnostics
+- ISA-TR88 PackML / Modbus TCP Supervisory Handshake
+- TPM Cost Deployment & Financial Cost Avoidance Tracking
 """
 
 import os
 import sys
 import time
-import queue
-import signal
 import sqlite3
-import logging
-import threading
-from pathlib import Path
 from datetime import datetime
+from typing import Dict, Any, Optional
 
-from dotenv import load_dotenv
-load_dotenv()
-
-from agent_core import PackagingCopilotAgent
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] (Watchdog-%(threadName)s) %(message)s",
-    datefmt="%H:%M:%S"
+from degradation_engine import DegradationDetector, DegradationState, DegradationAssessment
+from factory_tools import (
+    execute_line_derate,
+    reserve_sap_spare_part,
+    trigger_safety_interlock,
+    create_autonomous_work_order,
+    check_loto_thermal_gate,
+    get_db_connection,
+    get_table_columns
 )
-logger = logging.getLogger("IndustrialWatchdog")
+from roi_engine import roi_engine
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "packaging_factory.db"
-
-MACHINE_RATED_CPH = {
-    "LINE_01": 24000,
-    "LINE_02": 7500,
-    "LINE_03": 12000
-}
+DB_PATH = "packaging_factory.db"
 
 
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.row_factory = sqlite3.Row
-    return conn
+class AutonomousPackagingDaemon:
+    """
+    Tiến trình điều phối tự trị khép kín (Autonomous Closed-Loop Orchestrator).
+    Giám sát liên tục các dây chuyền đóng gói Tetra Pak & SIG Combibloc.
+    """
 
+    def __init__(self, db_path: str = DB_PATH, window_size: int = 15):
+        self.db_path = db_path
+        self.detector = DegradationDetector(window_size=window_size)
+        # Bộ theo dõi trạng thái can thiệp để tránh trigger lặp lại liên tục
+        self._machine_active_intervention: Dict[str, bool] = {}
+        self._last_processed_id: int = 0
 
-def ensure_edge_buffer_compatibility():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS realtime_edge_buffer (
-        line_id TEXT PRIMARY KEY,
-        record_id INTEGER NOT NULL,
-        last_updated TEXT NOT NULL,
-        machine_name TEXT NOT NULL,
-        temp_cleanroom_c REAL NOT NULL,
-        temp_sonotrode_c REAL NOT NULL,
-        speed_servo_rpm REAL NOT NULL,
-        tension_torque_nm REAL NOT NULL,
-        cutting_knife_wear_min INTEGER NOT NULL,
-        delta_t REAL NOT NULL,
-        dt_dt REAL NOT NULL,
-        p_mech_kw REAL NOT NULL,
-        heat_strain_index REAL NOT NULL,
-        error_code TEXT NOT NULL,
-        is_failure INTEGER NOT NULL,
-        alert_severity TEXT NOT NULL,
-        interlock_latched INTEGER NOT NULL DEFAULT 0,
-        machine_state TEXT NOT NULL DEFAULT 'RUNNING',
-        active_work_order_id TEXT DEFAULT NULL
-    );
-    """)
+    def _sync_last_telemetry_id(self):
+        """Đồng bộ ID telemetry cuối cùng trong DB để chỉ quét các bản ghi mới."""
+        try:
+            conn = get_db_connection(self.db_path)
+            cursor = conn.cursor()
+            cols = get_table_columns(cursor, "fact_sensor_telemetry")
+            col_id = "telemetry_id" if "telemetry_id" in cols else ("id" if "id" in cols else None)
+            if col_id:
+                cursor.execute(f"SELECT MAX({col_id}) FROM fact_sensor_telemetry")
+                max_id = cursor.fetchone()[0]
+                self._last_processed_id = max_id or 0
+            conn.close()
+        except Exception:
+            self._last_processed_id = 0
 
-    cursor.execute("PRAGMA table_info(realtime_edge_buffer);")
-    existing_cols = [row["name"] for row in cursor.fetchall()]
-
-    if "interlock_latched" not in existing_cols:
-        cursor.execute("ALTER TABLE realtime_edge_buffer ADD COLUMN interlock_latched INTEGER NOT NULL DEFAULT 0;")
-    if "machine_state" not in existing_cols:
-        cursor.execute("ALTER TABLE realtime_edge_buffer ADD COLUMN machine_state TEXT NOT NULL DEFAULT 'RUNNING';")
-    if "active_work_order_id" not in existing_cols:
-        cursor.execute("ALTER TABLE realtime_edge_buffer ADD COLUMN active_work_order_id TEXT DEFAULT NULL;")
-
-    conn.commit()
-    conn.close()
-
-
-def determine_current_shift() -> str:
-    current_hour = datetime.now().hour
-    if 6 <= current_hour < 14:
-        return "Shift 1"
-    elif 14 <= current_hour < 22:
-        return "Shift 2"
-    else:
-        return "Shift 3"
-
-
-class AutonomousIndustrialWatchdog:
-    """Daemon tự trị đóng vai trò Trực ca Cơ Điện số 24/7."""
-
-    def __init__(self, poll_interval_sec: float = 0.2):
-        self.poll_interval = poll_interval_sec
-        self.task_queue: queue.Queue = queue.Queue(maxsize=50)
-        self.stop_event = threading.Event()
+    def process_telemetry_frame(self, frame: Dict[str, Any]) -> Optional[DegradationAssessment]:
+        """
+        Xử lý 1 frame dữ liệu cảm biến và thực thi chu trình can thiệp tự trị.
+        """
+        machine_id = str(frame.get("line_id") or frame.get("machine_id") or "LINE_01")
         
-        self.worker_thread = threading.Thread(
-            target=self._ai_worker_consumer,
-            name="WorkerAI",
-            daemon=True
-        )
+        # 1. Bơm frame vào Degradation Detector
+        assessment = self.detector.ingest_frame(machine_id, frame)
+        
+        # 2. Xử lý Trạng thái AMBER: Can thiệp dự báo tự trị (Predictive Intervention)
+        if assessment.state == DegradationState.AMBER:
+            if not self._machine_active_intervention.get(machine_id, False):
+                print(f"\n================================================================================")
+                print(f"🚨 [CẢNH BÁO SỚM AMBER PHÁT HIỆN]: Dây chuyền {machine_id}")
+                print(f"📊 Điểm suy thoái: {assessment.degradation_score}% | Cửa sổ phân tích: {assessment.buffer_len} frames")
+                for r in assessment.drift_reasons:
+                    print(f"   ↳ ⚠️ {r}")
 
-    def start(self):
-        print("\n" + "=" * 80)
-        print("  KHỞI ĐỘNG AUTONOMOUS WATCHDOG AGENT DAEMON (FAST-PATH ZERO-TOOL)")
-        print("  Tối ưu hóa: Gemini 3.6 Flash | Phản hồi RCA siêu tốc ~1.2s | Miễn nhiễm 429")
-        print("=" * 80 + "\n")
+                # BƯỚC 2.1: Bắt tay PLC hạ tốc độ chạy cầm chừng (Limp-Home Derate: 24k -> 18k cph)
+                derate_res = execute_line_derate(
+                    machine_id=machine_id,
+                    target_speed_cph=18000,
+                    reason=f"Degradation Drift Detected: {assessment.drift_reasons[0]}"
+                )
+                print(f"⚡ [PLC HANDSHAKE]: Đã hạ tốc độ {machine_id} -> 18,000 cph (Giảm 25% ứng suất cơ nhiệt)")
 
-        ensure_edge_buffer_compatibility()
-        self.worker_thread.start()
-        self._producer_sensor_watcher()
+                # BƯỚC 2.2: Tự động trừ kho và xuất phiếu lĩnh dao cắt mới SAP PM
+                failure_mode = "CUTTER_WEAR" if "dao" in assessment.drift_reasons[0].lower() else "MECHANICAL_DRIFT"
+                sap_res = reserve_sap_spare_part(machine_id=machine_id, failure_mode=failure_mode)
+                slip = sap_res.get("requisition_slip", {})
+                print(f"📦 [SAP PM KHO VẬT TƯ]: Đã xuất phiếu {slip.get('requisition_id')}")
+                print(f"   ↳ Vật tư: {slip.get('part_name')} ({slip.get('sap_material_code')})")
+                print(f"   ↳ Vị trí: {slip.get('shelf_location')} | Tồn kho sau trừ: {slip.get('remaining_warehouse_stock')} bộ")
 
-    def stop(self):
-        logger.info("Đang dừng Daemon an toàn...")
-        self.stop_event.set()
-        self.task_queue.put(None)
-        self.worker_thread.join(timeout=3.0)
-        logger.info("Đã tắt an toàn Autonomous Watchdog Daemon.")
+                # BƯỚC 2.3: Tạo Phiếu công tác số hóa (Preventive Work Order)
+                wo_res = create_autonomous_work_order(
+                    machine_id=machine_id,
+                    error_code="WARN-DRIFT-PREV",
+                    summary=(
+                        f"Bảo trì dự phòng: Dao mòn {assessment.metrics.get('curr_tool_wear', 0)}m. "
+                        f"Đã chuẩn bị sẵn phụ tùng {slip.get('sap_material_code')} tại {slip.get('shelf_location')}."
+                    ),
+                    priority="HIGH",
+                    assigned_to="Kỹ thuật viên Trực ca (Biên Hòa 2)"
+                )
+                print(f"📝 [WORK ORDER SỐ HÓA]: Đã tạo phiếu bảo trì {wo_res['work_order_id']}")
 
-    def _producer_sensor_watcher(self):
-        logger.info("Producer bắt đầu giám sát trạng thái Interlock...")
+                # BƯỚC 2.4: Định lượng Giá trị Kinh tế & Hiệu quả TPM (ROI Ledger)
+                roi_res = roi_engine.compute_intervention_roi(
+                    machine_id=machine_id,
+                    trigger_event="AUTONOMOUS_AMBER_DERATE_INTERVENTION",
+                    work_order_ref=wo_res['work_order_id']
+                )
+                print(f"💰 [FINANCIAL ROI METRIC]:")
+                print(f"   ↳ Thời gian dừng máy cứu được : {roi_res.downtime_saved_minutes} phút")
+                print(f"   ↳ Sản lượng Milo bảo toàn     : {roi_res.units_saved:,} hộp")
+                print(f"   ↳ TỔNG CHI PHÍ TRÁNH ĐƯỢC      : {roi_res.total_cost_avoidance_vnd:,.0f} VNĐ")
+                print(f"================================================================================\n")
 
-        while not self.stop_event.is_set():
-            try:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT line_id, record_id, last_updated, machine_name, temp_cleanroom_c,
-                           temp_sonotrode_c, delta_t, speed_servo_rpm, tension_torque_nm,
-                           p_mech_kw, cutting_knife_wear_min, error_code, is_failure, 
-                           alert_severity, interlock_latched, machine_state
-                    FROM realtime_edge_buffer;
-                """)
-                active_lines = [dict(r) for r in cursor.fetchall()]
+                self._machine_active_intervention[machine_id] = True
 
-                for state in active_lines:
-                    line_id = state["line_id"]
-                    is_latched = state.get("interlock_latched", 0)
-                    mach_state = state.get("machine_state", "RUNNING")
-                    err_code = state["error_code"]
-                    rec_id = state["record_id"]
+        # 3. Xử lý Trạng thái RED: Dừng bảo vệ khẩn cấp (Safety Interlock Latch)
+        elif assessment.state == DegradationState.RED:
+            print(f"\n💥💥💥 [SAFETY INTERLOCK TRIP]: DÂY CHUYỀN {machine_id} ĐÃ BỊ KHÓA AN TOÀN!")
+            print(f"Lý do: {assessment.drift_reasons}")
+            trigger_safety_interlock(
+                machine_id=machine_id,
+                reason=f"Degradation Critical Trip: {', '.join(assessment.drift_reasons)}"
+            )
+            # Kiểm tra ngay cổng an toàn nhiệt
+            thermal = check_loto_thermal_gate(machine_id)
+            print(f"🔒 [EHS LOTO GATE]: Nhiệt độ hiện tại: {thermal['current_temperature_celsius']}°C | Trạng thái: {thermal['status']}")
 
-                    if is_latched == 1 and mach_state == "TRIPPED":
-                        logger.warning(
-                            f"⚡ [INTERLOCK DETECTED] Bắt tín hiệu DỪNG MÁY trên {line_id}! "
-                            f"Frame #{rec_id} | Mã lỗi: {err_code}."
-                        )
+        # 4. Trạng thái GREEN: Reset trạng thái can thiệp khi máy đã ổn định trở lại
+        elif assessment.state == DegradationState.GREEN:
+            if self._machine_active_intervention.get(machine_id, False):
+                self._machine_active_intervention[machine_id] = False
 
-                        cursor.execute("""
-                            UPDATE realtime_edge_buffer 
-                            SET machine_state = 'DIAGNOSING' 
-                            WHERE line_id = ?;
-                        """, (line_id,))
-                        conn.commit()
+        return assessment
 
-                        try:
-                            self.task_queue.put_nowait(state)
-                        except queue.Full:
-                            logger.error(f"Hàng đợi đầy! Bỏ qua frame #{rec_id}.")
+    def run_stream_replay(self, csv_path: str = "data/cleaned_telemetry.csv", target_line: str = "LINE_01", delay_sec: float = 0.2):
+        import pandas as pd
+        if not os.path.exists(csv_path):
+            csv_path = "cleaned_telemetry.csv"
 
-                conn.close()
-                time.sleep(self.poll_interval)
+        df = pd.read_csv(csv_path)
+        df_line = df[df["line_id"] == target_line].copy() if "line_id" in df.columns else df.copy()
 
-            except Exception as e:
-                logger.error(f"Lỗi trong Producer Sensor Watcher: {e}")
-                time.sleep(0.5)
+        test_slice = df_line.head(26)
 
-    def _ai_worker_consumer(self):
-        logger.info("Luồng Worker AI sẵn sàng đón nhận sự cố từ Hàng đợi...")
-        agent_brain = PackagingCopilotAgent()
+        print(f"🚀 BẮT ĐẦU CHẠY AUTONOMOUS DAEMON TRÊN LUỒNG DỮ LIỆU {target_line} ({len(test_slice)} frames)...")
+        time.sleep(1.0)
 
-        while not self.stop_event.is_set():
-            try:
-                task_data = self.task_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            if task_data is None:
-                self.task_queue.task_done()
+        for idx, (_, row) in enumerate(test_slice.iterrows(), start=1):
+            frame = {
+                "line_id": target_line,
+                "air_temp": float(row.get("ambient_temp_c", 25.0)),
+                "process_temp": float(row.get("ultrasonic_temp_c", 36.0)),
+                "rot_speed": float(row.get("rot_speed_rpm", 1500.0)),
+                "torque": float(row.get("tension_torque_nm", 40.0)),
+                "tool_wear": float(row.get("cutting_knife_wear_min", 0.0)),
+                "p_mech": float(row.get("p_mech_kw", 6.0)),
+                "delta_t": float(row.get("delta_t", 10.5)),
+            }
+            assessment = self.process_telemetry_frame(frame)
+            
+            icon = "🟢" if assessment.state == DegradationState.GREEN else ("🟡" if assessment.state == DegradationState.AMBER else "🔴")
+            print(f"[{idx:02d}/26] Telemetry -> Wear: {frame['tool_wear']:5.1f}m | T: {frame['torque']:4.1f}Nm | {icon} State: {assessment.state.value:5s} | Score: {assessment.degradation_score:5.1f}%")
+            
+            # NẾU GẶP RED: CỖ MÁY NGẮT ĐIỆN VẬT LÝ, DỪNG TIẾN TRÌNH NGAY LẬP TỨC
+            if assessment.state == DegradationState.RED:
+                print("\n🛑 [EMERGENCY HARD STOP]: CƠ CHẾ INTERLOCK ĐÃ NGẮT HOÀN TOÀN DÂY CHUYỀN!")
+                print(f"   ↳ Cắt nguồn biến tần servo | Xả khí nén xi-lanh kẹp dao")
+                print(f"   ↳ Chuyển sang chế độ bảo trì an toàn EHS LOTO.")
+                print(f"   ↳ Dừng nhận tín hiệu cảm biến cho đến khi hoàn tất thay thế linh kiện.")
                 break
 
-            try:
-                self._process_incident_with_ai(agent_brain, task_data)
-            except Exception as e:
-                logger.error(f"Lỗi khi Worker AI xử lý sự cố: {e}")
-            finally:
-                self.task_queue.task_done()
+            time.sleep(delay_sec)
 
-    def _process_incident_with_ai(self, agent_brain: PackagingCopilotAgent, sensor_state: dict):
-        line = sensor_state["line_id"]
-        err = sensor_state["error_code"]
-        rec_id = sensor_state["record_id"]
-        severity = sensor_state["alert_severity"]
-
-        print("\n" + "🚨" * 40)
-        logger.warning(
-            f"[ASYNC AI DISPATCHED] Bắt đầu phân tích khẩn cấp sự cố {severity} trên {line} | Frame #{rec_id} | Mã lỗi: {err}"
-        )
-
-        t_start = time.time()
-        # GỌI HÀM FAST SINGLE-SHOT (KHÔNG QUA TOOL CALLING)
-        rca_diagnosis = agent_brain.diagnose_incident_fast(sensor_state)
-        elapsed = round(time.time() - t_start, 2)
-
-        logger.info(f"⚡ [FAST RCA COMPLETED] Hoàn tất chẩn đoán trong {elapsed} giây (1 Request duy nhất).")
-
-        print("\n" + "-" * 80)
-        print(f"📋 [KẾT QUẢ CHẨN ĐOÁN CHO {line} - LỖI {err}]:")
-        print(rca_diagnosis)
-        print("-" * 80)
-
-        self._record_work_order_and_handshake(sensor_state, rca_diagnosis)
-        print("🚨" * 40 + "\n")
-
-    def _record_work_order_and_handshake(self, sensor_state: dict, rca_text: str):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        now_dt = datetime.now()
-        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-        wo_id = f"WO-AUTO-{now_dt.strftime('%Y%m%d%H%M%S')}"
-        line = sensor_state["line_id"]
-        err = sensor_state["error_code"]
-        rec_id = int(sensor_state.get("record_id", 1))
-
-        shift = determine_current_shift()
-        downtime_minutes = 15.0
-        rated_cph = MACHINE_RATED_CPH.get(line, 12000)
-        impact_units_lost = int((rated_cph / 60.0) * downtime_minutes)
-
-        try:
-            # 1. Ghi nhận sự cố vào fact_downtime_events
-            cursor.execute("""
-            INSERT INTO fact_downtime_events (
-                record_id, line_id, timestamp, shift_id, error_code, 
-                downtime_duration_minutes, impact_units_lost
-            ) VALUES (?, ?, ?, ?, ?, ?, ?);
-            """, (rec_id, line, now_str, shift, err, downtime_minutes, impact_units_lost))
-            event_id = cursor.lastrowid
-
-            # 2. Tạo Work Order khẩn cấp chuẩn TPM LOTO PENDING_ISOLATION
-            tech_assigned = "KTV. Truc Ca Co Dien (Tu dong phan bo)"
-            cursor.execute("""
-            INSERT INTO fact_work_orders (
-                work_order_id, event_id, line_id, error_code, created_at,
-                priority, loto_status, technician_assigned, resolution_notes, order_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, (
-                wo_id,
-                event_id,
-                line,
-                err,
-                now_str,
-                "P1_URGENT",
-                "PENDING_ISOLATION",
-                tech_assigned,
-                f"[AUTO-GENERATED BY COPILOT RCA]: {rca_text[:400]}...",
-                "OPEN"
-            ))
-
-            # 3. BẮN TÍN HIỆU HANDSHAKE ACK MỞ KHÓA DÂY CHUYỀN
-            cursor.execute("""
-                UPDATE realtime_edge_buffer
-                SET active_work_order_id = ?,
-                    machine_state = 'ACK_DISPATCHED'
-                WHERE line_id = ?;
-            """, (wo_id, line))
-
-            conn.commit()
-            logger.info(
-                f"⚡ [HANDSHAKE DISPATCHED] Đã lưu Phiếu Bảo Trì: {wo_id}\n"
-                f"   >> Event ID: {event_id} | Dây chuyền: {line} | Frame: #{rec_id} | Mã lỗi: {err}\n"
-                f"   >> Thất thoát: {impact_units_lost:,} hộp | Trạng thái: OPEN (PENDING_ISOLATION)\n"
-                f"   >> ĐÃ BẮN TÍN HIỆU MỞ KHÓA CHO SIMULATOR CHẠY TIẾP!"
-            )
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Lỗi thực thi SQL Work Order: {e}")
-        finally:
-            conn.close()
-
-
-def main():
-    daemon = AutonomousIndustrialWatchdog(poll_interval_sec=0.2)
-
-    def handle_shutdown(signum, frame):
-        logger.info("Nhận tín hiệu kết thúc (Ctrl+C). Đang tắt Daemon...")
-        daemon.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
-    try:
-        daemon.start()
-    except Exception as e:
-        logger.critical(f"Lỗi sập Daemon: {e}")
-        daemon.stop()
-
+        print("\n🏁 KẾT THÚC VÒNG ĐỜI GIÁM SÁT DÂY CHUYỀN!")
 
 if __name__ == "__main__":
-    main()
+    print("================================================================================")
+    print("🏭 NESTLE VIETNAM - AUTONOMOUS PACKAGING COPILOT DAEMON (CLOSED-LOOP)")
+    print("================================================================================")
+    daemon = AutonomousPackagingDaemon(window_size=15)
+    daemon.run_stream_replay(target_line="LINE_01", delay_sec=0.15)

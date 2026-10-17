@@ -1,251 +1,160 @@
-#!/usr/bin/env python3
 """
-================================================================================
-NESTLE DONG NAI FACTORY - INDUSTRIAL PACKAGING DIGITAL TWIN
-Module: IoT Edge Gateway Simulator (Closed-Loop Handshake - Clean Output Edition)
-Mechanism:
-  - Streams telemetry frames sequentially.
-  - Activates Safety Interlock upon failure (Single clean notification).
-  - Silent Polling: Silently waits in background until AI Copilot dispatches Work Order.
-  - Automatically clears fault, resets interlock, and resumes streaming.
-Author: Nguyen Doan Hoang (Digital Technical Specialist Candidate)
-Reviewed by: Lead Industrial Data & AI Engineer
-================================================================================
+simulate_line.py
+----------------
+Stochastic Industrial Packaging Line Simulator (Real Shop-floor Physics).
+Simulates continuous, probabilistic machinery degradation without hardcoded scripts.
+Fully integrated with SQLite telemetry historian, PLC registers, and LOTO resets.
 """
 
 import os
-import sys
-import time
+import random
 import sqlite3
-import logging
-import argparse
-from pathlib import Path
 from datetime import datetime
-import pandas as pd
+from typing import Dict, Any
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] (IoT-Gateway) %(message)s",
-    datefmt="%H:%M:%S"
-)
-logger = logging.getLogger("TelemetryStreamer")
+from industrial_bridge import plc_bridge, PLCHoldingRegisters
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "packaging_factory.db"
-DATA_DIR = BASE_DIR / "data"
-PARQUET_PATH = DATA_DIR / "cleaned_telemetry.parquet"
-CSV_PATH = DATA_DIR / "cleaned_telemetry.csv"
+DB_PATH = "packaging_factory.db"
 
 
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+class StochasticPackagingLineSimulator:
+    """
+    Cỗ máy Digital Twin mô phỏng vật lý ngẫu nhiên thời gian thực.
+    Không dùng kịch bản cố định - Các hiện tượng cơ nhiệt tích lũy tự nhiên.
+    """
 
+    def __init__(self, machine_id: str = "LINE_01", db_path: str = DB_PATH):
+        self.machine_id = machine_id
+        self.db_path = db_path
+        
+        # Điểm xuất phát vật lý ngẫu nhiên ban đầu
+        self.knife_wear_m: float = random.uniform(60.0, 85.0) # Bắt đầu ở dải vận hành giữa ca
+        self.ultrasonic_temp_c: float = random.uniform(34.0, 36.5)
+        self.ambient_temp_c: float = 25.5
+        self.rot_speed_rpm: float = 1500.0
+        self.torque_nm: float = 40.0
+        self.p_mech_kw: float = 6.28
+        self.is_tripped: bool = False
 
-def ensure_edge_buffer_table(conn: sqlite3.Connection):
-    """Khởi tạo và tự động migrate các cột Handshake cần thiết."""
-    cursor = conn.cursor()
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS realtime_edge_buffer (
-        line_id TEXT PRIMARY KEY,
-        record_id INTEGER NOT NULL,
-        last_updated TEXT NOT NULL,
-        machine_name TEXT NOT NULL,
-        temp_cleanroom_c REAL NOT NULL,
-        temp_sonotrode_c REAL NOT NULL,
-        speed_servo_rpm REAL NOT NULL,
-        tension_torque_nm REAL NOT NULL,
-        cutting_knife_wear_min INTEGER NOT NULL,
-        delta_t REAL NOT NULL,
-        dt_dt REAL NOT NULL,
-        p_mech_kw REAL NOT NULL,
-        heat_strain_index REAL NOT NULL,
-        error_code TEXT NOT NULL,
-        is_failure INTEGER NOT NULL,
-        alert_severity TEXT NOT NULL,
-        interlock_latched INTEGER NOT NULL DEFAULT 0,
-        machine_state TEXT NOT NULL DEFAULT 'RUNNING',
-        active_work_order_id TEXT DEFAULT NULL
-    );
-    """)
+    def replace_knife_and_service(self):
+        """Kỹ thuật viên hoàn tất bảo trì, thay dao mới và vệ sinh máy."""
+        self.knife_wear_m = 0.0
+        self.ultrasonic_temp_c = 33.0
+        self.torque_nm = 39.5
+        self.p_mech_kw = 5.8
+        self.is_tripped = False
+        plc_bridge.write_holding_register(self.machine_id, PLCHoldingRegisters.REG_CURRENT_ACTUAL_SPEED, 24000)
+        plc_bridge.write_holding_register(self.machine_id, PLCHoldingRegisters.REG_SAFETY_INTERLOCK, 0)
 
-    cursor.execute("PRAGMA table_info(realtime_edge_buffer);")
-    existing_cols = [row[1] for row in cursor.fetchall()]
-    
-    if "interlock_latched" not in existing_cols:
-        cursor.execute("ALTER TABLE realtime_edge_buffer ADD COLUMN interlock_latched INTEGER NOT NULL DEFAULT 0;")
-    if "machine_state" not in existing_cols:
-        cursor.execute("ALTER TABLE realtime_edge_buffer ADD COLUMN machine_state TEXT NOT NULL DEFAULT 'RUNNING';")
-    if "active_work_order_id" not in existing_cols:
-        cursor.execute("ALTER TABLE realtime_edge_buffer ADD COLUMN active_work_order_id TEXT DEFAULT NULL;")
-    
-    conn.commit()
+    def step(self) -> Dict[str, Any]:
+        """
+        Thực thi 1 giây vận hành thực tế (1 tick = 1 frame SCADA):
+        """
+        plc_speed = plc_bridge.read_holding_register(self.machine_id, PLCHoldingRegisters.REG_CURRENT_ACTUAL_SPEED) or 24000
+        is_interlocked = (plc_bridge.read_holding_register(self.machine_id, PLCHoldingRegisters.REG_SAFETY_INTERLOCK) == 1)
 
+        # 1. Trạng thái dừng khẩn cấp (Interlock Trip / LOTO)
+        if is_interlocked or self.is_tripped:
+            actual_speed = 0
+            self.torque_nm = 0.0
+            self.p_mech_kw = 0.0
+            # Khi máy dừng, nhiệt độ đầu hàn nguội dần về nhiệt độ phòng
+            if self.ultrasonic_temp_c > self.ambient_temp_c + 2.0:
+                self.ultrasonic_temp_c -= 0.5
+            status_text = "INTERLOCK_TRIP"
+            is_fail = 1 if self.is_tripped else 0
 
-def load_telemetry_source() -> pd.DataFrame:
-    if PARQUET_PATH.exists():
-        df = pd.read_parquet(PARQUET_PATH)
-    elif CSV_PATH.exists():
-        df = pd.read_csv(CSV_PATH)
-    else:
-        raise FileNotFoundError("Không tìm thấy file telemetry sạch! Hãy chạy scripts/etl_telemetry.py trước.")
-    return df
+        # 2. Trạng thái chạy cầm chừng Limp-Home (AMBER do Agent hạ tốc độ)
+        elif plc_speed <= 18000:
+            actual_speed = 18000
+            # Giảm 25% tốc độ -> Ứng suất giảm mạnh, mòn dao chậm lại rất nhiều
+            wear_rate = random.uniform(0.1, 0.25)
+            self.knife_wear_m += wear_rate
+            self.torque_nm = 35.0 + random.normalvariate(0, 1.0)
+            self.p_mech_kw = (2 * 3.14159 * 1350.0 * self.torque_nm) / 60000.0
+            self.ultrasonic_temp_c += random.choice([-0.1, 0.0, 0.1])
+            status_text = "LIMP_HOME_ACTIVE"
+            is_fail = 0
 
-
-def stream_telemetry(line_filter: str = "LINE_01", delay_seconds: float = 0.3, max_steps: int = 100):
-    df = load_telemetry_source()
-
-    if line_filter != "ALL":
-        df = df[df["line_id"] == line_filter].copy()
-
-    df = df.sort_values(by="timestamp").reset_index(drop=True)
-    total_records = len(df)
-
-    conn = get_db_connection()
-    ensure_edge_buffer_table(conn)
-    cursor = conn.cursor()
-
-    print("\n" + "=" * 80)
-    print(f"   KHỞI ĐỘNG IOT EDGE GATEWAY (CLOSED-LOOP DIGITAL TWIN)")
-    print(f"   Dây chuyền: {line_filter} | Tổng số bản ghi: {total_records:,}")
-    print(f"   Cơ chế: Safety Interlock Latch & Silent Handshake")
-    print("=" * 80)
-
-    try:
-        step = 0
-        for idx, row in df.iterrows():
-            step += 1
-            if max_steps and step > max_steps:
-                logger.info(f"Đã đạt giới hạn mô phỏng kiểm thử ({max_steps} frames). Dừng stream.")
-                break
-
-            current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            is_fail = int(row["is_failure"])
-            severity = row["alert_severity"]
-            err_code = str(row["error_code"]).strip()
-            line_id = row["line_id"]
-
-            is_critical_fault = (is_fail == 1) or (severity == "CRITICAL") or (err_code not in ["NORMAL", "NONE", ""])
-
-            # Cập nhật buffer thời gian thực
-            cursor.execute("""
-            INSERT INTO realtime_edge_buffer (
-                line_id, record_id, last_updated, machine_name, temp_cleanroom_c,
-                temp_sonotrode_c, speed_servo_rpm, tension_torque_nm,
-                cutting_knife_wear_min, delta_t, dt_dt, p_mech_kw,
-                heat_strain_index, error_code, is_failure, alert_severity,
-                interlock_latched, machine_state, active_work_order_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(line_id) DO UPDATE SET
-                record_id = excluded.record_id,
-                last_updated = excluded.last_updated,
-                temp_cleanroom_c = excluded.temp_cleanroom_c,
-                temp_sonotrode_c = excluded.temp_sonotrode_c,
-                speed_servo_rpm = excluded.speed_servo_rpm,
-                tension_torque_nm = excluded.tension_torque_nm,
-                cutting_knife_wear_min = excluded.cutting_knife_wear_min,
-                delta_t = excluded.delta_t,
-                dt_dt = excluded.dt_dt,
-                p_mech_kw = excluded.p_mech_kw,
-                heat_strain_index = excluded.heat_strain_index,
-                error_code = excluded.error_code,
-                is_failure = excluded.is_failure,
-                alert_severity = excluded.alert_severity,
-                interlock_latched = excluded.interlock_latched,
-                machine_state = excluded.machine_state,
-                active_work_order_id = excluded.active_work_order_id;
-            """, (
-                line_id, int(row["record_id"]), current_time_str, row["machine_name"],
-                row["temp_cleanroom_c"], row["temp_sonotrode_c"], row["speed_servo_rpm"],
-                row["tension_torque_nm"], int(row["cutting_knife_wear_min"]), row["delta_t"],
-                row["dt_dt"], row["p_mech_kw"], row["heat_strain_index"], err_code,
-                is_fail, severity,
-                1 if is_critical_fault else 0,
-                "TRIPPED" if is_critical_fault else "RUNNING",
-                None
-            ))
-            conn.commit()
-
-            # Định dạng màu cho log frame
-            tag = "\033[92m[NORMAL]  \033[0m"
-            if severity == "WARNING":
-                tag = "\033[93m[WARNING] \033[0m"
-            elif is_critical_fault:
-                tag = "\033[91m[CRITICAL]\033[0m"
-
-            print(
-                f"{tag} Frame #{step:03d} | Line: {line_id} | "
-                f"T_Sono: {row['temp_sonotrode_c']:>5.2f}°C | ΔT: {row['delta_t']:>4.2f}°C | "
-                f"RPM: {row['speed_servo_rpm']:>6.1f} | Torque: {row['tension_torque_nm']:>4.1f}Nm | "
-                f"P: {row['p_mech_kw']:>4.2f}kW | Dao mòn: {row['cutting_knife_wear_min']:>3d}m | "
-                f"Mã lỗi: {err_code}"
-            )
-
-            # ------------------------------------------------------------------
-            # KHI CÓ SỰ CỐ: KHÓA DÂY CHUYỀN VÀ CHỜ TĨNH LẶNG (SILENT POLLING)
-            # ------------------------------------------------------------------
-            if is_critical_fault:
-                print(
-                    f"\n\033[91m🛑 [SAFETY INTERLOCK KÍCH HOẠT] {line_id} phát hiện sự cố {err_code} tại Frame #{step:03d}!\033[0m\n"
-                    f"   >> Băng chuyền dừng khẩn cấp. Đang chờ Watchdog Agent tạo Work Order..."
-                )
-
-                # Vòng lặp chờ Handshake tĩnh lặng hoàn toàn (Không in log lặp)
-                while True:
-                    cursor.execute("""
-                        SELECT machine_state, active_work_order_id 
-                        FROM realtime_edge_buffer 
-                        WHERE line_id = ?;
-                    """, (line_id,))
-                    status_row = cursor.fetchone()
-
-                    # Khi Watchdog Agent đã bắn tín hiệu ACK_DISPATCHED kèm mã Work Order
-                    if status_row and status_row[0] == "ACK_DISPATCHED" and status_row[1]:
-                        wo_id = status_row[1]
-                        print(
-                            f"\033[92m✅ [HANDSHAKE ACK] Đã nhận Phiếu bảo trì {wo_id} từ AI Copilot!\033[0m\n"
-                            f"   >> Mô phỏng KTV thực thi LOTO & khắc phục sự cố (2.0s)..."
-                        )
-                        time.sleep(2.0)
-
-                        # Giải phóng Interlock, phục hồi trạng thái máy về RUNNING
-                        reset_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        cursor.execute("""
-                            UPDATE realtime_edge_buffer
-                            SET interlock_latched = 0,
-                                machine_state = 'RUNNING',
-                                active_work_order_id = NULL,
-                                error_code = 'NORMAL',
-                                is_failure = 0,
-                                alert_severity = 'NORMAL',
-                                last_updated = ?
-                            WHERE line_id = ?;
-                        """, (reset_time_str, line_id))
-                        conn.commit()
-
-                        print(f"\033[92m🔄 [MACHINE RESET] {line_id} đã hồi phục trạng thái RUNNING. Tiếp tục phát dòng dữ liệu!\033[0m\n")
-                        break
-
-                    # Kiểm tra ngầm mỗi 0.3s không in log
-                    time.sleep(0.3)
-
+        # 3. Trạng thái chạy định mức 24.000 cph (NOMINAL)
+        else:
+            actual_speed = 24000
+            # Dao càng mòn thì tốc độ mòn càng gia tốc
+            if self.knife_wear_m >= 100.0:
+                # Vùng suy thoái: ma sát tăng, chấn động ngẫu nhiên xuất hiện
+                wear_rate = random.uniform(1.2, 2.8)
+                self.torque_nm = 46.0 + random.normalvariate(0, 4.5) # Rung lắc phương sai cao
+                self.ultrasonic_temp_c += random.uniform(0.05, 0.2)
             else:
-                time.sleep(delay_seconds)
+                wear_rate = random.uniform(0.4, 0.8)
+                self.torque_nm = 40.5 + random.normalvariate(0, 1.2)
+                self.ultrasonic_temp_c += random.choice([-0.1, 0.0, 0.1])
 
-    except KeyboardInterrupt:
-        logger.info("Nhận lệnh dừng (Ctrl+C). Đóng Gateway...")
-    finally:
-        conn.close()
-        print("=" * 80)
-        logger.info("Hoàn tất phiên mô phỏng IoT Gateway.")
+            self.knife_wear_m += wear_rate
+            self.p_mech_kw = (2 * 3.14159 * self.rot_speed_rpm * self.torque_nm) / 60000.0
+            status_text = "NOMINAL_RUNNING"
+            is_fail = 0
+
+            # Nguy cơ sập máy tự nhiên nếu KTV bỏ mặc vượt 140m
+            if self.knife_wear_m >= 142.0:
+                self.is_tripped = True
+                self.torque_nm = 4.6 # Đứt tải
+                self.p_mech_kw = 1.38
+                status_text = "CATASTROPHIC_KNIFE_BREAK"
+                is_fail = 1
+                plc_bridge.write_holding_register(self.machine_id, PLCHoldingRegisters.REG_SAFETY_INTERLOCK, 1)
+
+        # Chặn nhiệt độ trong dải vật lý hợp lý
+        self.ultrasonic_temp_c = round(max(26.0, min(self.ultrasonic_temp_c, 52.0)), 1)
+        delta_t = round(self.ultrasonic_temp_c - self.ambient_temp_c, 1)
+
+        frame = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "line_id": self.machine_id,
+            "actual_speed_cph": actual_speed,
+            "rot_speed_rpm": round(self.rot_speed_rpm, 1) if actual_speed > 0 else 0.0,
+            "tension_torque_nm": round(self.torque_nm, 1),
+            "cutting_knife_wear_min": round(self.knife_wear_m, 1),
+            "p_mech_kw": round(self.p_mech_kw, 2),
+            "ambient_temp_c": self.ambient_temp_c,
+            "ultrasonic_temp_c": self.ultrasonic_temp_c,
+            "delta_t": delta_t,
+            "status": status_text,
+            "is_failure": is_fail
+        }
+
+        # Lưu liên tục vào fact_sensor_telemetry như một hệ thống SCADA Historian thực tế
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO fact_sensor_telemetry (
+                    timestamp, line_id, rot_speed_rpm, tension_torque_nm,
+                    cutting_knife_wear_min, p_mech_kw, ambient_temp_c,
+                    ultrasonic_temp_c, delta_t, is_failure
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                frame["timestamp"], frame["line_id"],
+                frame["rot_speed_rpm"], frame["tension_torque_nm"],
+                frame["cutting_knife_wear_min"], frame["p_mech_kw"],
+                frame["ambient_temp_c"], frame["ultrasonic_temp_c"],
+                frame["delta_t"], frame["is_failure"]
+            ))
+
+            # Nếu máy sập khẩn cấp (is_fail = 1), ghi ngay 1 bản ghi vào fact_downtime_events
+            if is_fail == 1:
+                cursor.execute("""
+                    INSERT INTO fact_downtime_events (
+                        machine_id, start_time, duration_minutes, error_code, root_cause
+                    ) VALUES (?, ?, 30.0, 'E-201', 'Gãy dao cắt màng vô trùng do mòn quá hạn')
+                """, (frame["line_id"], frame["timestamp"]))
+
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        return frame
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IoT Telemetry Stream Gateway (Closed-Loop Handshake)")
-    parser.add_argument("--line", type=str, default="LINE_01", help="Dây chuyền cần stream (LINE_01, LINE_02, LINE_03, ALL)")
-    parser.add_argument("--delay", type=float, default=0.25, help="Độ trễ giữa các frame khi bình thường (giây)")
-    parser.add_argument("--steps", type=int, default=100, help="Số khung hình mô phỏng kiểm thử (mặc định 100)")
-    args = parser.parse_args()
-
-    stream_telemetry(line_filter=args.line, delay_seconds=args.delay, max_steps=args.steps)
+line_simulator = StochasticPackagingLineSimulator(machine_id="LINE_01")

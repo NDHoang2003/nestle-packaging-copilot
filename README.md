@@ -1,109 +1,108 @@
-# 🏭 Nestlé Packaging Copilot & Digital Twin (Nestlé Đồng Nai Factory)
-
-> **Hệ sinh thái Công nghiệp Khép kín (Industrial AI & Cyber-Physical Digital Twin):** Kết nối IT - OT, Giám sát Cảm biến Thời gian thực, Chốt chặn An toàn LOTO Handshake, Chẩn đoán Sự cố Tự trị Tốc độ cao (Fast Single-Shot RCA Agent) và Trung tâm Điều hành Sản xuất (Industrial Operations Center).
-> 
-> **Ứng viên:** Nguyễn Doãn Hoàng (B.S. Computer Science - HCMUT, Data Analyst)  
-> **Vị trí mục tiêu:** Digital Technical Specialist - Nhà máy Nestlé Đồng Nai (KCN Biên Hòa 2)  
-> **Tuyến báo cáo:** Manufacturing Excellence Manager (TPM / Lean / OEE / Kaizen)
+# 🏭 Nestlé Packaging Digital Twin & AI Copilot
+### Autonomous Predictive Maintenance & Closed-Loop Intervention System
+**Target Deployment:** Nestlé Dong Nai Factory (Bien Hoa 2 Industrial Zone)  
+**Candidate:** Nguyen Doan Hoang (Computer Science, HCMC University of Technology - VNU-HCM)  
+**Reporting Line:** Manufacturing Excellence Manager (TPM / OEE / Lean / EHS)
 
 ---
 
-## 📐 Kiến trúc Tổng thể Hệ thống (IT-OT Convergence Architecture)
+## 📌 Executive Summary
+In high-speed aseptic beverage packaging lines (Tetra Pak A3/Speed running at **24,000 packs/hour** for Milo UHT 115ml), unplanned downtime due to mechanical cutting knife fractures causes catastrophic losses: paper jamming, product spillage, sterile chamber contamination, and an average of **30 minutes** of unplanned downtime (**12,000 lost packs**).
 
+This project upgrades the factory from a **Reactive (Post-failure RCA)** model to an **Autonomous Predictive Intervention Ecosystem**:
+1. **Physics-Informed Degradation Engine:** Detects knife wear rate, torque variance chatter, and mechanical power drift across a 15-frame sliding window, opening a **15–20 minute early warning window (AMBER)**.
+2. **Autonomous Limp-Home Mode & PLC Handshake:** Automatically sends speed derating commands via Modbus/OPC UA Holding Registers (from 24,000 down to 18,000 cph), cutting wear rates by 80% to safely bridge the shift handover.
+3. **Automated SAP PM Spare Parts Reservation:** Instantly checks warehouse inventory in `dim_spare_parts` and issues a digital requisition slip for replacement cartridge `#SAP-MAT-991024` at **Rack B2-Slot 04**.
+4. **EHS LOTO Thermal Gate Enforcement:** Blocks machine restart until ultrasonic sonotrode temperature cools to **$T \le 40.0^\circ\text{C}$**.
+5. **Direct Financial ROI Monetization:** Quantifies **27 minutes saved**, **10,800 Milo packs rescued**, and **93,900,000 VNĐ cost avoidance** per incident.
 
-       [ CẢM BIẾN DÂY CHUYỀN TETRA PAK / SIG ]
-                          │
-                          ▼
-            scripts/etl_telemetry.py (Pha 1)
-       (UCI AI4I Benchmark 10.000 records -> Feature Engineering)
-                          │
-                          ▼
-             setup_database.py (Pha 2)
-       (packaging_factory.db: SQLite Star Schema Data Warehouse)
-                          │
-     ┌────────────────────┴──────────────────────────────────────┐
-     ▼                                                           ▼
-factory_tools.py (Pha 3)                                simulate_line.py (Pha 4.1)
-- MTTR, MTBF, Availability Metrics                      (IoT Edge Gateway Simulator)
-- Phân tích Pareto 80/20 Lost Units                              │
-- Chốt chặn An toàn LOTO Guardrail                               ▼
-     │                                                 realtime_edge_buffer
-     │                                            (Bi-directional Interlock Latch)
-     └────────────────────┬──────────────────────────────────────┘
-                          │ (Hard Interlock Handshake)
-                          ▼
-             agent_daemon.py & agent_core.py (Pha 4.2)
-       (Autonomous Watchdog: Sense -> Think -> Act)
-       - Async Producer-Consumer Architecture (Thread-safe)
-       - Fast Single-Shot RCA (Gemini 3.5/3.1 Flash-Lite, 1.2s response, Zero AFC Bloat)
-       - Edge Heuristic Expert Engine Fallback (100% Offline-safe)
-       - Mở Work Order OPEN (PENDING_ISOLATION) & Giữ khóa dừng máy an toàn
-                          │
-     ┌────────────────────┴──────────────────────────────────────┐
-     ▼                                                           ▼
-api_gateway.py (Pha 5.1)                                app.py (Pha 5.2)
-(FastAPI Industrial Edge Gateway)                      (Streamlit Industrial Operations Center)
-- Chuẩn OpenAPI 3.0 / Swagger                          - Live Telemetry Grid (LINE_01, 02, 03)
-- Sẵn sàng tích hợp Microsoft Power Apps & Power BI     - Incident Ticker nhấp nháy đỏ khi TRIPPED
-                                                       - Form Kiểm định LOTO (Nhiệt < 40°C)
-                                                       - Interactive Copilot Chat
+---
 
-## 🚀 Tiến độ Kỹ thuật Đã Hoàn Thành (Pha 1 đến Pha 5)
+## 🏛️ System Architecture
 
++-----------------------------------------------------------------------+
+|           PHYSICAL PACKAGING ASSET / SCADA TELEMETRY (1 HZ)           |
+|      (Tetra Pak A3/Speed: Speed, Knife Wear, Torque, Temperature)     |
++-----------------------------------------------------------------------+
+                                    |
+                                    v
++-----------------------------------------------------------------------+
+|                   degradation_engine.py (TRU COT 1)                   |
+|         Physics-Informed Sliding Window (OLS Slope dy/dt)             |
+|   [GREEN: 24k cph]  --->  [AMBER: Parameter Drift]  --->  [RED: Trip] |
++-----------------------------------------------------------------------+
+                                    |
+                     +--------------+--------------+
+                     | (State == AMBER)            | (State == RED)
+                     v                             v
++-----------------------------------+     +-----------------------------+
+|     industrial_bridge.py          |     |    factory_tools.py         |
+|  - PLC Holding Register #40001    |     |  - Safety Interlock Latch   |
+|  - Limp-Home Derate: 18,000 cph   |     |  - LOTO Thermal Gate        |
+|  - 2-Way Handshake ACK            |     |    (T_sonotrode <= 40.0 C)  |
++-----------------------------------+     +-----------------------------+
+                     |
+                     v
++-----------------------------------+
+|        factory_tools.py           |
+|  - Auto-reserve SAP Spare Part    |
+|  - Material #SAP-MAT-991024       |
+|  - Rack B2 - Slot 04 (Warehouse 1)|
++-----------------------------------+
+                     |
+                     v
++-----------------------------------------------------------------------+
+|                      roi_engine.py (TRU COT 3)                        |
+|               Financial ROI & Cost Avoidance Ledger                   |
+|       Downtime Saved: 27 mins | Units Saved: 10,800 Milo Packs        |
+|              Total Cost Avoidance: 93,900,000 VND / incident          |
++-----------------------------------------------------------------------+
 
-### ✅ Pha 1: Dữ liệu Công nghiệp & Feature Engineering (scripts/etl_telemetry.py)
+---
 
-- Xử lý và làm sạch 10.000 bản ghi cảm biến công nghiệp theo chuẩn AI4I.
+## 📂 Project Repository Structure
 
-- Ánh xạ vào 3 dây chuyền Nestlé Đồng Nai:
-  + LINE_01: Tetra Pak A3/Speed 115ml (Milo 115ml - Công suất: 24.000 hộp/h)
-  + LINE_02: Tetra Pak TBA/19 180ml (Milo 180ml - Công suất: 7.500 hộp/h)
-  + LINE_03: SIG Combibloc CFA 312 (Sữa 250ml - Công suất: 12.000 hộp/h)
+| File | Role / Responsibility |
+| :--- | :--- |
+| `simulate_line.py` | Stochastic Physical Asset Simulator (Dynamic Digital Twin responsive to PLC speed & knife swap). |
+| `degradation_engine.py` | Physics-Informed Sliding Window Degradation Detector (OLS Slope & Rolling Variance). |
+| `industrial_bridge.py` | Industrial PLC Supervisory Bridge (Holding Registers 40001–40005 & 2-way Handshake). |
+| `factory_tools.py` | Autonomous Business Toolset (PLC Speed Derate, SAP Spare Parts Reservation, LOTO Thermal Gate). |
+| `roi_engine.py` | TPM Cost Deployment & Financial ROI Ledger (Monetizing downtime savings into VNĐ). |
+| `agent_daemon.py` | 24/7 Autonomous Background Consumer Daemon (Orchestrating the closed loop). |
+| `app.py` | Industrial Operations HMI Console designed strictly for Shift Maintenance Technicians. |
+| `inspect_db.py` | Database Inspector tool to audit all Fact and Dimension tables in `packaging_factory.db`. |
+| `export_powerbi_data.py` | Star Schema data exporter generating clean CSVs for Power BI Executive Dashboards. |
 
-- Tính toán tham số cơ điện tử:
-  + Delta_T = T_sonotrode - T_cleanroom (Nhiệt chênh lệch phát hiện nghẽn Chiller)
-  + dT/dt: Đạo hàm biến thiên nhiệt đầu hàn theo thời gian
-  + P_mech = (Torque * 2 * pi * RPM) / 60.000 (Công suất cơ học động cơ Servo, kW)
-  + HSI = (P_mech * 100) / (|Delta_T| + 0.1) (Chỉ số căng thẳng tải nhiệt)
+---
 
+## 📊 Industrial Value Proposition (TPM & Financial ROI)
 
-### ✅ Pha 2: Relational Data Modeling Star Schema (setup_database.py)
+| Metric | Without AI Copilot (AS-IS Baseline) | With Autonomous Copilot (TO-BE) | Impact / Net Improvement |
+| :--- | :--- | :--- | :--- |
+| **Downtime Mode** | Unplanned Catastrophic Crash | Planned Quick-Swap (Cassette) | **Eliminated emergency line freeze** |
+| **Downtime Duration** | 30.0 minutes | 3.0 minutes | **-27.0 minutes (-90% MTTR)** |
+| **Product Loss** | 12,000 packs lost | 1,200 packs lost | **+10,800 Milo packs saved** |
+| **Packaging Scrap** | ~60m shredded sterile paper | 0m clean web cut | **7,500,000 VNĐ scrap avoided** |
+| **Total Cost Avoidance** | 0 VNĐ | **93,900,000 VNĐ / cycle** | **Direct bottom-line P&L protection** |
 
-- Xây dựng kho dữ liệu SQLite (packaging_factory.db) chuẩn Kimball.
+---
 
-- dim_machines: Thông tin tài sản thiết bị và công suất định danh CPH.
+## 🚀 Quickstart Guide
 
-- dim_error_catalog: Chuẩn hóa 5 mã lỗi Nestlé (E-105, E-401, E-204, E-302, E-999) kèm quy chuẩn LOTO và PPE.
+### 1. Environment Setup
+git clone https://github.com/NDHoang2003/nestle-packaging-copilot.git
+cd nestle-packaging-copilot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-- fact_sensor_telemetry: Lưu 10.000 bản ghi cảm biến với Composite Index (line_id, timestamp).
+### 2. Verify Database & Spare Parts Catalog
+python setup_spare_parts.py
+python inspect_db.py
 
-- fact_downtime_events: Lưu 339 sự cố dừng máy, tính Units Lost = (CPH / 60) * Downtime_Minutes.
+### 3. Launch Technician HMI Console
+streamlit run app.py
 
-- fact_work_orders: Lưu 339 phiếu bảo trì với trạng thái an toàn LOTO (PENDING_ISOLATION, VERIFIED_LOTO, RESTORED).
-
-
-### ✅ Pha 3: Analytics Engine & LOTO Guardrails (factory_tools.py)
-
-- Bộ chỉ số TPM Reliability: MTTR = 10.09 phút, MTBF = 25.53 phút, Availability = 71.67%.
-
-- Phân tích Pareto 80/20: Nhóm Vital Few gồm E-401 (37.11%) và E-302 (28.14%) chiếm 65.26% tổng sản lượng thất thoát.
-
-- Chốt chặn an toàn nhiệt LOTO: Ngăn chặn tuyệt đối việc đóng phiếu nếu T_sonotrode > 40.0°C (Nguy cơ bỏng cấp 2).
-
-
-### ✅ Pha 4: Closed-Loop Digital Twin & Fast-Path AI (simulate_line.py, agent_daemon.py, agent_core.py)
-
-- Safety Interlock Handshake: Máy gặp sự cố sẽ dừng khẩn cấp (TRIPPED), khóa cứng dây chuyền và chỉ chạy tiếp sau khi Kỹ thuật viên nghiệm thu và đóng phiếu trên Dashboard.
-
-- Async Producer-Consumer Daemon: Tách biệt luồng cảm biến khỏi luồng AI bằng hàng đợi queue.Queue, triệt tiêu nghẽn I/O và drop frame.
-
-- Fast Single-Shot Zero-Tool RCA: Gemini phản hồi trong 1.2 giây, triệt tiêu 100% lỗi 429 Rate Limit và 503 Overload.
-
-- Industrial Edge Expert Engine: Tự động suy luận vật lý cục bộ trong 0.01s khi mất mạng Internet.
-
-
-### ✅ Pha 5: Operations Center & Integration Gateway (api_gateway.py, app.py)
-
-- api_gateway.py: Cổng RESTful API chuẩn OpenAPI 3.0 / Swagger, sẵn sàng tích hợp Microsoft Power Apps và Power BI.
-
-- app.py: Dashboard Streamlit giám sát trực quan 3 dây chuyền, còi báo động đỏ nhấp nháy khi TRIPPED, form kiểm định LOTO đóng phiếu mở khóa máy và khung chat Copilot tương tác.
+### 4. Export Datasets for Power BI Reporting
+python export_powerbi_data.py
