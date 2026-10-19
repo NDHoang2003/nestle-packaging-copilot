@@ -115,7 +115,7 @@ class StochasticPackagingLineSimulator:
             return error_code, "WARNING"
 
         if actual_speed <= 18000:
-            return error_code, "WARNING"
+            return "NORMAL", "WARNING"
 
         return "NORMAL", "NORMAL"
 
