@@ -177,7 +177,7 @@ def advance_simulation_step(num_steps: int = 1):
             "process_temp": frame["ultrasonic_temp_c"],
             "rot_speed": frame["rot_speed_rpm"],
             "torque": frame["tension_torque_nm"],
-            "tool_wear": frame["cutting_knife_wear_min"],
+            "tool_wear": frame["cutting_knife_wear_m"],
             "p_mech": frame["p_mech_kw"],
             "delta_t": frame["delta_t"],
         })
@@ -198,7 +198,7 @@ def advance_simulation_step(num_steps: int = 1):
             else:
                 err_code = "E-204"
                 part_type = "CUT"
-                reason_txt = f"Dao cắt màng mòn tiệm cận ngưỡng: {frame['cutting_knife_wear_min']}m"
+                reason_txt = f"Dao cắt màng mòn tiệm cận ngưỡng: {frame['cutting_knife_wear_m']}m"
 
             execute_line_derate("LINE_01", 18000, reason_txt)
 
@@ -264,7 +264,7 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric(label="Tốc Độ Đóng Gói (PLC)", value=f"{current_speed:,} cph")
 with c2:
-    wear_m = latest_frame["cutting_knife_wear_min"]
+    wear_m = latest_frame["cutting_knife_wear_m"]
     st.metric(label="Độ Mòn Dao Cắt", value=f"{wear_m:.1f} m")
 with c3:
     st.metric(label="Công Suất Cơ P_mech", value=f"{latest_frame['p_mech_kw']:.2f} kW")

@@ -1,26 +1,22 @@
+
 #!/usr/bin/env python3
 """
-================================================================================
-NESTLE DONG NAI FACTORY - INDUSTRIAL PACKAGING DIGITAL TWIN
-Module: Enterprise Relational Data Warehouse Modeling (Phase 2)
-Database: packaging_factory.db (SQLite Star Schema / 3NF)
-Author: Nguyen Doan Hoang (Digital Technical Specialist Candidate)
-Reviewed by: Lead Industrial Data & AI Engineer
-================================================================================
+Nestle Dong Nai Factory - Industrial Packaging Digital Twin
+Database: packaging_factory.db
 """
 
-import os
-import sys
-import sqlite3
 import logging
+import sqlite3
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] (Nestle-DB) %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("DatabaseSetup")
 
@@ -32,21 +28,17 @@ CSV_PATH = DATA_DIR / "cleaned_telemetry.csv"
 
 
 def create_connection():
-    """Tạo kết nối SQLite có hỗ trợ khóa ngoại (Foreign Keys)."""
+    """Create a SQLite connection with foreign keys enabled."""
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def create_schema(cursor):
-    """
-    Khởi tạo cấu trúc bảng Star Schema chuẩn Enterprise.
-    Xóa bảng cũ nếu tồn tại để tái tạo sạch sẽ.
-    """
-    logger.info("Đang khởi tạo cấu trúc bảng (DDL Schema)...")
+    """Recreate the demo schema from scratch."""
+    logger.info("Creating database schema...")
 
     cursor.executescript("""
-    -- 1. BẢNG CHIỀU: DÂY CHUYỀN THIẾT BỊ (dim_machines)
     DROP TABLE IF EXISTS fact_work_orders;
     DROP TABLE IF EXISTS fact_downtime_events;
     DROP TABLE IF EXISTS fact_sensor_telemetry;
@@ -58,26 +50,24 @@ def create_schema(cursor):
         machine_name TEXT NOT NULL,
         manufacturer TEXT NOT NULL,
         model TEXT NOT NULL,
-        rated_capacity_cph INTEGER NOT NULL, -- Công suất định danh: Hộp/Giờ (Cartons Per Hour)
+        rated_capacity_cph INTEGER NOT NULL,
         target_product TEXT NOT NULL,
         cleanroom_area TEXT NOT NULL,
         commissioning_date TEXT NOT NULL,
         status TEXT DEFAULT 'ACTIVE'
     );
 
-    -- 2. BẢNG CHIỀU: SỔ TAY MÃ LỖI BẢO TRÌ TIÊU CHUẨN (dim_error_catalog)
     CREATE TABLE dim_error_catalog (
         error_code TEXT PRIMARY KEY,
         failure_type TEXT NOT NULL,
         description TEXT NOT NULL,
         root_cause_category TEXT NOT NULL,
         standard_recovery_time_min REAL NOT NULL,
-        loto_procedure_required INTEGER NOT NULL, -- 1: Bắt buộc LOTO, 0: Kiểm tra nhanh
+        loto_procedure_required INTEGER NOT NULL,
         required_ppe TEXT NOT NULL,
         sop_reference TEXT NOT NULL
     );
 
-    -- 3. BẢNG SỰ KIỆN: DỮ LIỆU CẢM BIẾN TELEMETRY (fact_sensor_telemetry)
     CREATE TABLE fact_sensor_telemetry (
         record_id INTEGER PRIMARY KEY,
         timestamp TEXT NOT NULL,
@@ -87,7 +77,13 @@ def create_schema(cursor):
         temp_sonotrode_c REAL NOT NULL,
         speed_servo_rpm REAL NOT NULL,
         tension_torque_nm REAL NOT NULL,
-        cutting_knife_wear_min INTEGER NOT NULL,
+
+        -- Historical AI4I data: wear measured in minutes.
+        cutting_knife_wear_min INTEGER,
+
+        -- Runtime simulator data: wear measured in metres.
+        cutting_knife_wear_m REAL,
+
         delta_t REAL NOT NULL,
         dt_dt REAL NOT NULL,
         p_mech_kw REAL NOT NULL,
@@ -95,17 +91,39 @@ def create_schema(cursor):
         error_code TEXT NOT NULL,
         is_failure INTEGER NOT NULL,
         alert_severity TEXT NOT NULL,
-        FOREIGN KEY (line_id) REFERENCES dim_machines(line_id),
-        FOREIGN KEY (error_code) REFERENCES dim_error_catalog(error_code)
+
+        -- Each record uses one wear unit, never both.
+        CHECK (
+            (
+                cutting_knife_wear_min IS NOT NULL
+                AND cutting_knife_wear_m IS NULL
+            )
+            OR
+            (
+                cutting_knife_wear_min IS NULL
+                AND cutting_knife_wear_m IS NOT NULL
+            )
+        ),
+
+        FOREIGN KEY (line_id)
+            REFERENCES dim_machines(line_id),
+
+        FOREIGN KEY (error_code)
+            REFERENCES dim_error_catalog(error_code)
     );
 
-    -- Tối ưu hóa truy vấn thời gian thực cho Streamlit & AI Agent
-    CREATE INDEX idx_telemetry_timestamp ON fact_sensor_telemetry(timestamp);
-    CREATE INDEX idx_telemetry_line_time ON fact_sensor_telemetry(line_id, timestamp);
-    CREATE INDEX idx_telemetry_failure ON fact_sensor_telemetry(is_failure, error_code);
-    CREATE INDEX idx_telemetry_shift ON fact_sensor_telemetry(shift_id);
+    CREATE INDEX idx_telemetry_timestamp
+        ON fact_sensor_telemetry(timestamp);
 
-    -- 4. BẢNG SỰ KIỆN: SỰ CỐ DỪNG MÁY DOWNTIME (fact_downtime_events)
+    CREATE INDEX idx_telemetry_line_time
+        ON fact_sensor_telemetry(line_id, timestamp);
+
+    CREATE INDEX idx_telemetry_failure
+        ON fact_sensor_telemetry(is_failure, error_code);
+
+    CREATE INDEX idx_telemetry_shift
+        ON fact_sensor_telemetry(shift_id);
+
     CREATE TABLE fact_downtime_events (
         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
         record_id INTEGER NOT NULL,
@@ -115,16 +133,26 @@ def create_schema(cursor):
         error_code TEXT NOT NULL,
         downtime_duration_minutes REAL NOT NULL,
         impact_units_lost INTEGER NOT NULL,
-        FOREIGN KEY (record_id) REFERENCES fact_sensor_telemetry(record_id),
-        FOREIGN KEY (line_id) REFERENCES dim_machines(line_id),
-        FOREIGN KEY (error_code) REFERENCES dim_error_catalog(error_code)
+
+        FOREIGN KEY (record_id)
+            REFERENCES fact_sensor_telemetry(record_id),
+
+        FOREIGN KEY (line_id)
+            REFERENCES dim_machines(line_id),
+
+        FOREIGN KEY (error_code)
+            REFERENCES dim_error_catalog(error_code)
     );
 
-    CREATE INDEX idx_downtime_line ON fact_downtime_events(line_id);
-    CREATE INDEX idx_downtime_error ON fact_downtime_events(error_code);
-    CREATE INDEX idx_downtime_shift ON fact_downtime_events(shift_id);
+    CREATE INDEX idx_downtime_line
+        ON fact_downtime_events(line_id);
 
-    -- 5. BẢNG SỰ KIỆN: PHIẾU BẢO TRÌ BẢO DƯỠNG (fact_work_orders)
+    CREATE INDEX idx_downtime_error
+        ON fact_downtime_events(error_code);
+
+    CREATE INDEX idx_downtime_shift
+        ON fact_downtime_events(shift_id);
+
     CREATE TABLE fact_work_orders (
         work_order_id TEXT PRIMARY KEY,
         event_id INTEGER NOT NULL,
@@ -132,29 +160,35 @@ def create_schema(cursor):
         error_code TEXT NOT NULL,
         created_at TEXT NOT NULL,
         priority TEXT NOT NULL,
-        loto_status TEXT NOT NULL DEFAULT 'PENDING_ISOLATION', -- PENDING_ISOLATION, VERIFIED_LOTO, RESTORED
+        loto_status TEXT NOT NULL DEFAULT 'PENDING_ISOLATION',
         technician_assigned TEXT NOT NULL,
         resolution_notes TEXT,
-        order_status TEXT NOT NULL DEFAULT 'OPEN', -- OPEN, IN_PROGRESS, CLOSED
+        order_status TEXT NOT NULL DEFAULT 'OPEN',
         closed_at TEXT,
-        FOREIGN KEY (event_id) REFERENCES fact_downtime_events(event_id),
-        FOREIGN KEY (line_id) REFERENCES dim_machines(line_id),
-        FOREIGN KEY (error_code) REFERENCES dim_error_catalog(error_code)
+
+        FOREIGN KEY (event_id)
+            REFERENCES fact_downtime_events(event_id),
+
+        FOREIGN KEY (line_id)
+            REFERENCES dim_machines(line_id),
+
+        FOREIGN KEY (error_code)
+            REFERENCES dim_error_catalog(error_code)
     );
 
-    CREATE INDEX idx_wo_status ON fact_work_orders(order_status);
-    CREATE INDEX idx_wo_line ON fact_work_orders(line_id);
-    """);
-    logger.info("Đã tạo hoàn tất Schema DDL với các quan hệ Khóa ngoại và Index tối ưu.")
+    CREATE INDEX idx_wo_status
+        ON fact_work_orders(order_status);
+
+    CREATE INDEX idx_wo_line
+        ON fact_work_orders(line_id);
+    """)
+
+    logger.info("Schema created successfully.")
 
 
 def seed_dimension_tables(cursor):
-    """
-    Nạp dữ liệu danh mục chuẩn cho dim_machines và dim_error_catalog.
-    """
-    logger.info("Đang nạp dữ liệu Bảng Chiều (Dimension Tables)...")
+    """Load machine and error catalog demo data."""
 
-    # Dữ liệu dim_machines
     machines_data = [
         (
             "LINE_01",
@@ -165,7 +199,7 @@ def seed_dimension_tables(cursor):
             "MILO_115ML",
             "Aseptic Cleanroom 1A",
             "2023-01-15",
-            "ACTIVE"
+            "ACTIVE",
         ),
         (
             "LINE_02",
@@ -176,7 +210,7 @@ def seed_dimension_tables(cursor):
             "MILO_180ML",
             "Aseptic Cleanroom 1B",
             "2021-08-10",
-            "ACTIVE"
+            "ACTIVE",
         ),
         (
             "LINE_03",
@@ -187,14 +221,24 @@ def seed_dimension_tables(cursor):
             "NESTLE_PURE_250ML",
             "Aseptic Cleanroom 2",
             "2022-04-20",
-            "ACTIVE"
-        )
+            "ACTIVE",
+        ),
     ]
+
     cursor.executemany("""
-    INSERT INTO dim_machines VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO dim_machines (
+            line_id,
+            machine_name,
+            manufacturer,
+            model,
+            rated_capacity_cph,
+            target_product,
+            cleanroom_area,
+            commissioning_date,
+            status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, machines_data)
 
-    # Dữ liệu dim_error_catalog
     catalog_data = [
         (
             "NORMAL",
@@ -204,85 +248,92 @@ def seed_dimension_tables(cursor):
             0.0,
             0,
             "Standard Cleanroom PPE",
-            "SOP-OPS-001"
+            "SOP-OPS-001",
         ),
         (
             "E-105",
             "Tool Wear Failure",
-            "Mòn dao cắt bao bì định hình mép hộp - mép cắt không đứt gây kẹt phôi",
+            "Mòn dao cắt bao bì định hình mép hộp",
             "Mechanical Cutting",
             25.0,
             1,
             "Safety Glasses, Cut-Resistant Gloves Level 5",
-            "SOP-MEC-105"
+            "SOP-MEC-105",
         ),
         (
             "E-401",
             "Heat Dissipation Failure",
-            "Quá nhiệt đầu hàn siêu âm Sonotrode / nghẽn đường chiller làm mát",
+            "Quá nhiệt đầu hàn siêu âm Sonotrode",
             "Thermal & Ultrasonic",
             45.0,
             1,
             "Thermal Insulated Gloves, Face Shield, LOTO Padlock",
-            "SOP-THM-401"
+            "SOP-THM-401",
         ),
         (
             "E-204",
             "Power Failure",
-            "Quá tải công suất động cơ Servo kéo màng giấy / Sụt áp biến tần",
+            "Quá tải công suất động cơ Servo",
             "Electrical & Drive",
             30.0,
             1,
             "Arc Flash Shield, Electrical Safety Gloves Class 0",
-            "SOP-ELE-204"
+            "SOP-ELE-204",
         ),
         (
             "E-302",
             "Overstrain Failure",
-            "Quá lực căng màng cuộn giấy vượt giới hạn bền - đứt cuộn giấy vô trùng",
+            "Quá lực căng màng cuộn giấy",
             "Packaging Material Strain",
             35.0,
             1,
             "Cut-Resistant Gloves, Standard PPE, LOTO Padlock",
-            "SOP-MAT-302"
+            "SOP-MAT-302",
         ),
         (
             "E-999",
             "Random Sensor / Line Jam",
-            "Cảm biến quang học lệch vạch đọc mã / Kẹt bao bì đột xuất",
+            "Lệch cảm biến hoặc kẹt bao bì",
             "Automation & Optical",
             15.0,
             0,
             "Standard Cleanroom PPE, Anti-static Wristband",
-            "SOP-AUT-999"
-        )
+            "SOP-AUT-999",
+        ),
     ]
+
     cursor.executemany("""
-    INSERT INTO dim_error_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO dim_error_catalog (
+            error_code,
+            failure_type,
+            description,
+            root_cause_category,
+            standard_recovery_time_min,
+            loto_procedure_required,
+            required_ppe,
+            sop_reference
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, catalog_data)
-    logger.info("Đã nạp thành công dim_machines (3 dòng) và dim_error_catalog (6 dòng).")
+
+    logger.info("Dimension tables seeded.")
 
 
 def load_telemetry_and_derive_facts(conn):
-    """
-    Nạp 10.000 dòng telemetry từ Parquet/CSV vào fact_sensor_telemetry.
-    Đồng thời tự động trích xuất fact_downtime_events và fact_work_orders.
-    """
-    logger.info("Đang đọc dữ liệu sạch từ Pha 1...")
+    """Load historical telemetry and generate demo maintenance events."""
+
     if PARQUET_PATH.exists():
         df = pd.read_parquet(PARQUET_PATH)
-        logger.info(f"Đã nạp thành công từ: {PARQUET_PATH}")
+        logger.info("Loaded telemetry from %s", PARQUET_PATH)
     elif CSV_PATH.exists():
         df = pd.read_csv(CSV_PATH)
-        logger.info(f"Đã nạp thành công từ: {CSV_PATH}")
+        logger.info("Loaded telemetry from %s", CSV_PATH)
     else:
-        raise FileNotFoundError("Không tìm thấy cleaned_telemetry.parquet hoặc cleaned_telemetry.csv trong data/!")
+        raise FileNotFoundError(
+            "Không tìm thấy cleaned_telemetry.parquet hoặc "
+            "cleaned_telemetry.csv trong thư mục data/."
+        )
 
-    cursor = conn.cursor()
-
-    # 1. Nạp dữ liệu vào fact_sensor_telemetry
-    logger.info("Đang nạp 10.000 bản ghi vào fact_sensor_telemetry...")
-    telemetry_records = df[[
+    required_columns = [
         "record_id",
         "timestamp_str",
         "shift_id",
@@ -298,123 +349,205 @@ def load_telemetry_and_derive_facts(conn):
         "heat_strain_index",
         "error_code",
         "is_failure",
-        "alert_severity"
-    ]].values.tolist()
+        "alert_severity",
+    ]
 
+    missing = set(required_columns) - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Dataset thiếu các cột bắt buộc: {sorted(missing)}"
+        )
+
+    cursor = conn.cursor()
+
+    logger.info("Loading historical telemetry...")
+
+    telemetry_records = df[required_columns].values.tolist()
+
+    # Use explicit column names. Historical records use minutes;
+    # cutting_knife_wear_m remains NULL for those records.
     cursor.executemany("""
-    INSERT INTO fact_sensor_telemetry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO fact_sensor_telemetry (
+            record_id,
+            timestamp,
+            shift_id,
+            line_id,
+            temp_cleanroom_c,
+            temp_sonotrode_c,
+            speed_servo_rpm,
+            tension_torque_nm,
+            cutting_knife_wear_min,
+            delta_t,
+            dt_dt,
+            p_mech_kw,
+            heat_strain_index,
+            error_code,
+            is_failure,
+            alert_severity
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, telemetry_records)
-    logger.info(f"Đã nạp thành công {len(telemetry_records)} bản ghi telemetry.")
 
-    # 2. Xây dựng fact_downtime_events từ các bản ghi có sự cố (is_failure == 1)
-    logger.info("Đang trích xuất và tính toán fact_downtime_events...")
+    logger.info(
+        "Loaded %s historical telemetry records.",
+        len(telemetry_records),
+    )
+
+    # Generate downtime events from historical failures.
     failure_df = df[df["is_failure"] == 1].copy()
 
-    # Lấy thông tin định mức thời gian và công suất máy để tính sản lượng thất thoát
-    cursor.execute("SELECT line_id, rated_capacity_cph FROM dim_machines;")
-    capacity_dict = {row[0]: row[1] for row in cursor.fetchall()}
+    cursor.execute(
+        "SELECT line_id, rated_capacity_cph FROM dim_machines"
+    )
+    capacity_dict = {
+        row[0]: row[1] for row in cursor.fetchall()
+    }
 
-    cursor.execute("SELECT error_code, standard_recovery_time_min FROM dim_error_catalog;")
-    recovery_dict = {row[0]: row[1] for row in cursor.fetchall()}
+    cursor.execute("""
+        SELECT error_code, standard_recovery_time_min
+        FROM dim_error_catalog
+    """)
+    recovery_dict = {
+        row[0]: row[1] for row in cursor.fetchall()
+    }
 
-    # Tái tạo thời gian dừng máy thực tế dựa trên định mức chuẩn + biến thiên ngẫu nhiên có kiểm soát
     np.random.seed(42)
+
     downtime_events = []
     work_orders = []
 
-    technicians = ["KTV. Nguyen Van An", "KTV. Tran Dinh Binh", "KTV. Le Hoang Cuong", "KTV. Pham Minh Dung"]
+    technicians = [
+        "KTV. Nguyen Van An",
+        "KTV. Tran Dinh Binh",
+        "KTV. Le Hoang Cuong",
+        "KTV. Pham Minh Dung",
+    ]
 
-    for idx, row in failure_df.iterrows():
+    for _, row in failure_df.iterrows():
         line = row["line_id"]
-        err = row["error_code"]
-        rec_id = int(row["record_id"])
-        ts = str(row["timestamp_str"])
+        error = row["error_code"]
+        record_id = int(row["record_id"])
+        timestamp = str(row["timestamp_str"])
         shift = row["shift_id"]
 
-        std_time = recovery_dict.get(err, 20.0)
-        # Thời gian downtime thực tế dao động quanh định mức chuẩn (±20%)
-        is_major_breakdown = np.random.rand() < 0.15
+        standard_time = recovery_dict.get(error, 20.0)
+        major_breakdown = np.random.rand() < 0.15
 
-        if is_major_breakdown:
-            # Sự cố lớn: mất 20 - 45 phút sửa chữa có LOTO
-            actual_downtime = round(std_time * np.random.uniform(0.85, 1.25), 1)
+        if major_breakdown:
+            downtime = round(
+                standard_time * np.random.uniform(0.85, 1.25),
+                1,
+            )
         else:
-            # Dừng nhỏ (Micro-stop): xử lý kẹt giấy, lau cảm biến chỉ mất 1 - 3 phút
-            actual_downtime = round(np.random.uniform(1.0, 3.5), 1)
+            downtime = round(
+                np.random.uniform(1.0, 3.5),
+                1,
+            )
 
-        # Sản lượng thất thoát (Lost Cartons) = (Công suất/giờ / 60) * số phút dừng máy
-        cph = capacity_dict.get(line, 10000)
-        units_lost = int((cph / 60.0) * actual_downtime)
+        capacity = capacity_dict.get(line, 10000)
+        units_lost = int((capacity / 60.0) * downtime)
 
         downtime_events.append((
-            rec_id,
+            record_id,
             line,
-            ts,
+            timestamp,
             shift,
-            err,
-            actual_downtime,
-            units_lost
+            error,
+            downtime,
+            units_lost,
         ))
 
     cursor.executemany("""
-    INSERT INTO fact_downtime_events (record_id, line_id, timestamp, shift_id, error_code, downtime_duration_minutes, impact_units_lost)
-    VALUES (?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO fact_downtime_events (
+            record_id,
+            line_id,
+            timestamp,
+            shift_id,
+            error_code,
+            downtime_duration_minutes,
+            impact_units_lost
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """, downtime_events)
-    logger.info(f"Đã trích xuất thành công {len(downtime_events)} sự cố dừng máy vào fact_downtime_events.")
 
-    # 3. Xây dựng fact_work_orders khép kín tương ứng với các sự cố dừng máy
-    logger.info("Đang sinh phiếu bảo trì khép kín fact_work_orders...")
-    cursor.execute("SELECT event_id, line_id, error_code, timestamp FROM fact_downtime_events;")
+    logger.info(
+        "Created %s downtime events.",
+        len(downtime_events),
+    )
+
+    cursor.execute("""
+        SELECT event_id, line_id, error_code, timestamp
+        FROM fact_downtime_events
+    """)
     db_events = cursor.fetchall()
 
-    for row in db_events:
-        ev_id, line, err, ts = row
-        wo_id = f"WO-{ts[:10].replace('-', '')}-{ev_id:04d}"
+    for event_id, line, error, timestamp in db_events:
+        work_order_id = (
+            f"WO-{timestamp[:10].replace('-', '')}-{event_id:04d}"
+        )
 
-        priority = "P1_URGENT" if err in ["E-401", "E-204"] else "P2_HIGH"
-        tech = np.random.choice(technicians)
+        priority = (
+            "P1_URGENT"
+            if error in ["E-401", "E-204"]
+            else "P2_HIGH"
+        )
 
-        # Giả lập trạng thái bảo trì: 95% sự cố trong quá khứ đã được đóng (CLOSED), 5% gần nhất đang mở/xử lý
-        if ev_id > len(db_events) - 15:
+        technician = str(np.random.choice(technicians))
+
+        if event_id > len(db_events) - 15:
             order_status = "IN_PROGRESS"
             loto_status = "VERIFIED_LOTO"
-            res_notes = "Đang cô lập nguồn điện và tiến hành cân chỉnh kỹ thuật."
+            notes = "Đang cô lập nguồn điện và tiến hành cân chỉnh kỹ thuật."
             closed_at = None
         else:
             order_status = "CLOSED"
             loto_status = "RESTORED"
-            res_notes = f"Đã khắc phục hoàn tất theo SOP chuẩn {err}. Bàn giao dây chuyền cho Trưởng ca."
-            closed_at = ts
+            notes = (
+                f"Đã khắc phục hoàn tất theo SOP chuẩn {error}. "
+                "Bàn giao dây chuyền cho Trưởng ca."
+            )
+            closed_at = timestamp
 
         work_orders.append((
-            wo_id,
-            ev_id,
+            work_order_id,
+            event_id,
             line,
-            err,
-            ts,
+            error,
+            timestamp,
             priority,
             loto_status,
-            tech,
-            res_notes,
+            technician,
+            notes,
             order_status,
-            closed_at
+            closed_at,
         ))
 
     cursor.executemany("""
-    INSERT INTO fact_work_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO fact_work_orders (
+            work_order_id,
+            event_id,
+            line_id,
+            error_code,
+            created_at,
+            priority,
+            loto_status,
+            technician_assigned,
+            resolution_notes,
+            order_status,
+            closed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, work_orders)
-    logger.info(f"Đã tạo thành công {len(work_orders)} phiếu bảo trì vào fact_work_orders.")
+
+    logger.info("Created %s work orders.", len(work_orders))
 
     conn.commit()
 
 
 def print_database_audit_report(conn):
-    """
-    Truy vấn kiểm tra tính toàn vẹn của Data Warehouse và in báo cáo thẩm định.
-    """
+    """Print row counts and basic demo database statistics."""
+
     cursor = conn.cursor()
+
     print("\n" + "=" * 80)
-    print("      BÁO CÁO THẨM ĐỊNH DATA WAREHOUSE - PACKAGING_FACTORY.DB")
+    print("PACKAGING FACTORY DATABASE AUDIT")
     print("=" * 80)
 
     tables = [
@@ -422,62 +555,98 @@ def print_database_audit_report(conn):
         "dim_error_catalog",
         "fact_sensor_telemetry",
         "fact_downtime_events",
-        "fact_work_orders"
+        "fact_work_orders",
     ]
 
     for table in tables:
-        cursor.execute(f"SELECT COUNT(*) FROM {table};")
-        cnt = cursor.fetchone()[0]
-        print(f"Bảng: {table:<25} | Số dòng: {cnt:>8,}")
+        cursor.execute(f"SELECT COUNT(*) FROM {table}")
+        count = cursor.fetchone()[0]
+        print(f"{table:<30} | {count:>8,} rows")
+
+    cursor.execute("""
+        SELECT
+            COUNT(*) AS total_rows,
+            SUM(
+                CASE
+                    WHEN cutting_knife_wear_min IS NOT NULL
+                    THEN 1 ELSE 0
+                END
+            ) AS minute_rows,
+            SUM(
+                CASE
+                    WHEN cutting_knife_wear_m IS NOT NULL
+                    THEN 1 ELSE 0
+                END
+            ) AS metre_rows
+        FROM fact_sensor_telemetry
+    """)
+
+    total, minute_rows, metre_rows = cursor.fetchone()
 
     print("-" * 80)
-    print("TOP 5 SỰ CỐ GÂY THẤT THOÁT SẢN LƯỢNG CAO NHẤT (PARETO LOST UNITS):")
-    query_lost = """
-    SELECT 
-        e.error_code,
-        c.failure_type,
-        COUNT(e.event_id) AS event_count,
-        ROUND(SUM(e.downtime_duration_minutes), 1) AS total_downtime_min,
-        SUM(e.impact_units_lost) AS total_units_lost
-    FROM fact_downtime_events e
-    JOIN dim_error_catalog c ON e.error_code = c.error_code
-    GROUP BY e.error_code, c.failure_type
-    ORDER BY total_units_lost DESC;
+    print(f"Telemetry total:             {total}")
+    print(f"Historical wear in minutes:  {minute_rows or 0}")
+    print(f"Runtime wear in metres:      {metre_rows or 0}")
+
+    lost_query = """
+        SELECT
+            e.error_code,
+            c.failure_type,
+            COUNT(e.event_id) AS event_count,
+            ROUND(
+                SUM(e.downtime_duration_minutes), 1
+            ) AS total_downtime_min,
+            SUM(e.impact_units_lost) AS total_units_lost
+        FROM fact_downtime_events e
+        JOIN dim_error_catalog c
+            ON e.error_code = c.error_code
+        GROUP BY e.error_code, c.failure_type
+        ORDER BY total_units_lost DESC
     """
-    lost_df = pd.read_sql_query(query_lost, conn)
+
+    lost_df = pd.read_sql_query(lost_query, conn)
+
+    print("\nTOP DOWNTIME IMPACT:")
     print(lost_df.to_string(index=False))
 
-    print("-" * 80)
-    print("THỐNG KÊ PHIẾU BẢO TRÌ (WORK ORDERS) THEO TRẠNG THÁI LOTO AN TOÀN:")
-    query_wo = """
-    SELECT 
-        order_status,
-        loto_status,
-        COUNT(*) AS total_tickets
-    FROM fact_work_orders
-    GROUP BY order_status, loto_status;
+    work_order_query = """
+        SELECT order_status, loto_status, COUNT(*) AS total_tickets
+        FROM fact_work_orders
+        GROUP BY order_status, loto_status
     """
-    wo_df = pd.read_sql_query(query_wo, conn)
-    print(wo_df.to_string(index=False))
-    print("=" * 80 + "\n")
+
+    work_order_df = pd.read_sql_query(
+        work_order_query,
+        conn,
+    )
+
+    print("\nWORK ORDERS:")
+    print(work_order_df.to_string(index=False))
+    print("=" * 80)
 
 
 def main():
-    logger.info("=== BẮT ĐẦU PHA 2: KHỞI TẠO RELATIONAL DATA WAREHOUSE ===")
+    logger.info("Starting demo database setup.")
+
     conn = create_connection()
+
     try:
         cursor = conn.cursor()
+
         create_schema(cursor)
         seed_dimension_tables(cursor)
         load_telemetry_and_derive_facts(conn)
         print_database_audit_report(conn)
-        logger.info(f"Database đã được tạo thành công tại: {DB_PATH.resolve()}")
-    except Exception as e:
-        logger.error(f"Lỗi khởi tạo database: {e}", exc_info=True)
+
+        logger.info("Database created at %s", DB_PATH)
+
+    except Exception:
         conn.rollback()
+        logger.exception("Database setup failed.")
+        raise
+
     finally:
         conn.close()
-    logger.info("=== HOÀN TẤT PHA 2 XUẤT SẮC ===")
 
 
 if __name__ == "__main__":
