@@ -1,245 +1,357 @@
 #!/usr/bin/env python3
 """
-================================================================================
-NESTLE DONG NAI FACTORY - INDUSTRIAL PACKAGING DIGITAL TWIN
-Module: Telemetry Ingestion & Physics-Based Feature Engineering (Phase 1)
-Target Lines: Tetra Pak A3/Speed 115ml, TBA/19 180ml, SIG Combibloc
-Author: Nguyen Doan Hoang (Digital Technical Specialist Candidate)
-Reviewed by: Lead Industrial Data & AI Engineer
-================================================================================
+AI4I ETL for Nestle Packaging Copilot
+=====================================
+
+Extracts the public AI4I 2020 benchmark, validates its schema and quality,
+engineers physics-based features, and exports CSV/Parquet.
+
+Important provenance rules:
+- AI4I is a synthetic benchmark dataset, not Nestle factory telemetry.
+- AI4I has no real timestamps; generated timestamps are simulation timestamps.
+- AI4I Type L/M/H does not establish a real mapping to Nestle production lines.
+  The optional Nestle scenario mapping is illustrative only.
+- If the source cannot be loaded, the pipeline fails rather than silently
+  replacing the benchmark with synthetic data.
 """
 
-import os
-import sys
+from __future__ import annotations
+
+import argparse
 import io
+import json
 import logging
-import zipfile
 import urllib.request
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
-# Thiết lập logging chuẩn công nghiệp
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] (Nestle-ETL) %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    format="%(asctime)s [%(levelname)s] (AI4I-ETL) %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("TelemetryETL")
+logger = logging.getLogger("AI4I_ETL")
 
-# Đường dẫn thư mục
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
-RAW_CSV_PATH = DATA_DIR / "ai4i2020.csv"
-OUTPUT_PARQUET_PATH = DATA_DIR / "cleaned_telemetry.parquet"
-OUTPUT_CSV_PATH = DATA_DIR / "cleaned_telemetry.csv"
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = SCRIPT_DIR.parent / "data"
+DEFAULT_RAW_PATH = DEFAULT_DATA_DIR / "ai4i2020.csv"
+DEFAULT_OUTPUT_DIR = DEFAULT_DATA_DIR / "processed"
+
+DATASET_URLS = [
+    "https://archive.ics.uci.edu/static/public/601/ai4i+2020+predictive+maintenance+dataset.zip",
+    "https://raw.githubusercontent.com/mandyiv/Predictive_Machine_Maintenance/main/ai4i2020.csv",
+]
+
+REQUIRED_COLUMNS = [
+    "UDI",
+    "Product ID",
+    "Type",
+    "Air temperature [K]",
+    "Process temperature [K]",
+    "Rotational speed [rpm]",
+    "Torque [Nm]",
+    "Tool wear [min]",
+    "Machine failure",
+    "TWF",
+    "HDF",
+    "PWF",
+    "OSF",
+    "RNF",
+]
+LABEL_COLUMNS = ["Machine failure", "TWF", "HDF", "PWF", "OSF", "RNF"]
+NUMERIC_COLUMNS = [
+    "UDI",
+    "Air temperature [K]",
+    "Process temperature [K]",
+    "Rotational speed [rpm]",
+    "Torque [Nm]",
+    "Tool wear [min]",
+    *LABEL_COLUMNS,
+]
+
+# This mapping is an illustrative scenario, not verified factory master data.
+ILLUSTRATIVE_NESTLE_MAP = {
+    "L": ("LINE_01", "Tetra Pak A3/Speed 115ml", "MILO_115ML"),
+    "M": ("LINE_02", "Tetra Pak TBA/19 180ml", "MILO_180ML"),
+    "H": ("LINE_03", "SIG Combibloc CFA 312", "NESTLE_PURE_250ML"),
+}
 
 
-def ensure_directories():
-    """Tạo thư mục data nếu chưa tồn tại."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def ensure_directories(data_dir: Path, output_dir: Path) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
 
-def download_ai4i_dataset() -> pd.DataFrame:
-    """
-    Tải tập dữ liệu 10.000 records AI4I 2020 từ UCI Machine Learning Repository.
-    Nếu có sự cố mạng, kích hoạt bộ sinh giả lập thống kê tương đương 100% (Fail-safe).
-    """
-    if RAW_CSV_PATH.exists():
-        logger.info(f"Đã tìm thấy file dữ liệu thô tại: {RAW_CSV_PATH}")
-        return pd.read_csv(RAW_CSV_PATH)
+def download_ai4i_dataset(raw_path: Path, allow_download: bool = True) -> pd.DataFrame:
+    """Load a local official-format CSV, optionally downloading the benchmark."""
+    if raw_path.exists():
+        logger.info("Loading local source dataset: %s", raw_path)
+        return pd.read_csv(raw_path)
 
-    urls = [
-        "https://archive.ics.uci.edu/static/public/601/ai4i+2020+predictive+maintenance+dataset.zip",
-        "https://archive.ics.uci.edu/ml/machine-learning-databases/00601/ai4i2020.csv",
-        "https://raw.githubusercontent.com/mandyiv/Predictive_Machine_Maintenance/main/ai4i2020.csv"
-    ]
+    if not allow_download:
+        raise FileNotFoundError(
+            f"Dataset not found at {raw_path}. Place ai4i2020.csv there "
+            "or rerun with downloading enabled."
+        )
 
-    headers = {"User-Agent": "Mozilla/5.0 (Nestle Dong Nai Industrial Copilot Pipeline)"}
+    headers = {"User-Agent": "Nestle-Packaging-Copilot-AI4I-ETL/1.0"}
+    errors: list[str] = []
 
-    for url in urls:
+    for url in DATASET_URLS:
         try:
-            logger.info(f"Đang kết nối tải dataset từ: {url} ...")
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                content = resp.read()
+            logger.info("Trying dataset source: %s", url)
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=25) as response:
+                payload = response.read()
 
-                # Nếu là file zip
-                if url.endswith(".zip"):
-                    with zipfile.ZipFile(io.BytesIO(content)) as zf:
-                        for filename in zf.namelist():
-                            if filename.endswith(".csv"):
-                                with zf.open(filename) as csv_file:
-                                    df_raw = pd.read_csv(csv_file)
-                                    df_raw.to_csv(RAW_CSV_PATH, index=False)
-                                    logger.info(f"Giải nén và lưu thành công vào: {RAW_CSV_PATH}")
-                                    return df_raw
-                else:
-                    # Nếu là file CSV trực tiếp
-                    df_raw = pd.read_csv(io.BytesIO(content))
-                    df_raw.to_csv(RAW_CSV_PATH, index=False)
-                    logger.info(f"Tải và lưu trực tiếp thành công vào: {RAW_CSV_PATH}")
-                    return df_raw
-        except Exception as e:
-            logger.warning(f"Không thể tải từ {url}: {e}")
+            if url.lower().endswith(".zip") or payload[:2] == b"PK":
+                with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                    csv_names = [
+                        name for name in archive.namelist()
+                        if name.lower().endswith(".csv")
+                    ]
+                    if not csv_names:
+                        raise ValueError("ZIP archive contains no CSV file")
+                    # Prefer the canonical AI4I file name if available.
+                    selected = next(
+                        (n for n in csv_names if "ai4i2020" in n.lower()),
+                        csv_names[0],
+                    )
+                    with archive.open(selected) as file_obj:
+                        df = pd.read_csv(file_obj)
+            else:
+                df = pd.read_csv(io.BytesIO(payload))
 
-    # FAIL-SAFE GENERATOR NẾU HẠ TẦNG MẠNG CÁCH LY HOẶC URL UCI BỊ THAY ĐỔI
-    logger.warning("Kích hoạt Fail-safe Engine: Tái tạo chính xác 10.000 bản ghi chuẩn phân phối thống kê AI4I 2020...")
-    np.random.seed(42)
-    n_records = 10000
+            validate_source_schema(df)
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(raw_path, index=False)
+            logger.info("Downloaded and cached source dataset: %s", raw_path)
+            return df
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            logger.warning("Source failed: %s", errors[-1])
 
-    # Phân bổ tỷ lệ sản phẩm: L (50%), M (30%), H (20%)
-    types = np.random.choice(["L", "M", "H"], size=n_records, p=[0.5, 0.3, 0.2])
-    air_temp_k = np.random.normal(300.0, 2.0, n_records)
-    process_temp_k = air_temp_k + np.random.normal(10.0, 1.0, n_records)
-    rot_speed_rpm = np.random.normal(1538, 179, n_records).astype(int)
-    rot_speed_rpm = np.clip(rot_speed_rpm, 1168, 2886)
-    torque_nm = np.random.normal(40.0, 10.0, n_records)
-    torque_nm = np.clip(torque_nm, 3.8, 76.6)
-    tool_wear_min = np.random.uniform(0, 250, n_records).astype(int)
+    raise RuntimeError(
+        "Unable to retrieve the AI4I dataset. No synthetic replacement was "
+        "generated, to avoid confusing simulated rows with benchmark data.\n"
+        + "\n".join(errors)
+    )
 
-    # Khởi tạo cờ hỏng hóc vật lý theo luật AI4I
-    twf = (tool_wear_min >= 210) & (np.random.rand(n_records) < 0.4)
-    delta_temp = process_temp_k - air_temp_k
-    hdf = (delta_temp < 8.6) & (rot_speed_rpm < 1380)
-    p_mech = (torque_nm * rot_speed_rpm * 2 * np.pi) / 60
-    pwf = (p_mech < 3500) | (p_mech > 9000)
-    
-    osf_limit = np.where(types == "L", 11000, np.where(types == "M", 12000, 13000))
-    osf = (tool_wear_min * torque_nm > osf_limit)
-    rnf = np.random.rand(n_records) < 0.001
 
-    machine_failure = (twf | hdf | pwf | osf | rnf).astype(int)
-
-    df_synth = pd.DataFrame({
-        "UDI": np.arange(1, n_records + 1),
-        "Product ID": [f"{t}{10000 + i}" for i, t in enumerate(types)],
-        "Type": types,
-        "Air temperature [K]": np.round(air_temp_k, 2),
-        "Process temperature [K]": np.round(process_temp_k, 2),
-        "Rotational speed [rpm]": rot_speed_rpm,
-        "Torque [Nm]": np.round(torque_nm, 1),
-        "Tool wear [min]": tool_wear_min,
-        "Machine failure": machine_failure,
-        "TWF": twf.astype(int),
-        "HDF": hdf.astype(int),
-        "PWF": pwf.astype(int),
-        "OSF": osf.astype(int),
-        "RNF": rnf.astype(int),
-    })
-    df_synth.to_csv(RAW_CSV_PATH, index=False)
-    logger.info(f"Đã tạo và lưu dữ liệu mô phỏng chuẩn AI4I vào: {RAW_CSV_PATH}")
-    return df_synth
+def validate_source_schema(df: pd.DataFrame) -> None:
+    missing = sorted(set(REQUIRED_COLUMNS) - set(df.columns))
+    if missing:
+        raise ValueError(
+            "Source schema does not match AI4I 2020. Missing columns: "
+            + ", ".join(missing)
+        )
+    if df.empty:
+        raise ValueError("Source dataset is empty.")
 
 
 def map_shift(hour: int) -> str:
-    """
-    Phân ca làm việc thực tế tại Nhà máy Nestlé Đồng Nai:
-    - Ca 1 (Shift 1): 06:00 - 13:59:59 (Ca sáng)
-    - Ca 2 (Shift 2): 14:00 - 21:59:59 (Ca chiều)
-    - Ca 3 (Shift 3): 22:00 - 05:59:59 (Ca đêm)
-    """
+    """Illustrative shift calendar; not a verified factory roster."""
     if 6 <= hour < 14:
         return "Shift 1"
-    elif 14 <= hour < 22:
+    if 14 <= hour < 22:
         return "Shift 2"
-    else:
-        return "Shift 3"
+    return "Shift 3"
 
 
-def map_error_code(row) -> str:
+def map_error_code(row: pd.Series) -> str:
     """
-    Ánh xạ sự cố vật lý AI4I thành Mã lỗi tiêu chuẩn bảo trì bao bì Nestlé:
-    - HDF -> E-401 (Sonotrode Sealing Overheat / Chiller Loop Fault)
-    - TWF -> E-105 (Blunt Packaging Cutting Knife / Paper Jam)
-    - PWF -> E-204 (Servo Feed Motor Power Overload / Undervoltage)
-    - OSF -> E-302 (Packaging Film High Tension / Web Tear)
-    - RNF -> E-999 (Optical Sensor Misalignment / Line Stoppage)
+    Illustrative mapping from AI4I failure labels to project error categories.
+    These codes are not confirmed Nestle CMMS/SAP error codes.
     """
     if row.get("HDF", 0) == 1:
         return "E-401"
-    elif row.get("TWF", 0) == 1:
+    if row.get("TWF", 0) == 1:
         return "E-105"
-    elif row.get("PWF", 0) == 1:
+    if row.get("PWF", 0) == 1:
         return "E-204"
-    elif row.get("OSF", 0) == 1:
+    if row.get("OSF", 0) == 1:
         return "E-302"
-    elif row.get("RNF", 0) == 1:
+    if row.get("RNF", 0) == 1:
         return "E-999"
-    elif row.get("Machine failure", 0) == 1:
+    if row.get("Machine failure", 0) == 1:
         return "E-999"
     return "NORMAL"
 
 
-def process_telemetry_features(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Thực hiện Feature Engineering và ánh xạ toàn diện vào dây chuyền đóng gói Nestlé.
-    """
-    logger.info("Bắt đầu xử lý Feature Engineering và chuẩn hóa đơn vị vật lý...")
-    df = df_raw.copy()
+def validate_and_quarantine(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Validate source rows; quarantine invalid rows instead of imputing them."""
+    validate_source_schema(df_raw)
+    df = df_raw[REQUIRED_COLUMNS].copy()
+    rows_input = len(df)
 
-    # Chuẩn hóa tên cột thô (loại bỏ ký tự đặc biệt nếu có)
-    col_mapping = {}
-    for col in df.columns:
-        if "udi" in col.lower() or "uid" in col.lower():
-            col_mapping[col] = "record_id"
-        elif "product id" in col.lower():
-            col_mapping[col] = "product_code"
-        elif "type" in col.lower():
-            col_mapping[col] = "product_type"
-        elif "air temperature" in col.lower():
-            col_mapping[col] = "raw_air_k"
-        elif "process temperature" in col.lower():
-            col_mapping[col] = "raw_proc_k"
-        elif "rotational speed" in col.lower():
-            col_mapping[col] = "speed_servo_rpm"
-        elif "torque" in col.lower():
-            col_mapping[col] = "tension_torque_nm"
-        elif "tool wear" in col.lower():
-            col_mapping[col] = "cutting_knife_wear_min"
-    df.rename(columns=col_mapping, inplace=True)
+    # Convert expected numeric values. Invalid text becomes NaN and is quarantined.
+    for col in NUMERIC_COLUMNS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # 1. Ánh xạ Thiết bị & Dây chuyền Nestlé Biên Hòa 2
-    # Type L (50%) -> LINE_01: Tetra Pak A3/Speed (Milo 115ml - Công suất cao)
-    # Type M (30%) -> LINE_02: Tetra Pak TBA/19 (Milo 180ml - Quy cách phổ thông)
-    # Type H (20%) -> LINE_03: SIG Combibloc CFA 312 (Sữa tươi / Nan Grow 250ml)
-    line_map = {
-        "L": ("LINE_01", "Tetra Pak A3/Speed 115ml", "MILO_115ML"),
-        "M": ("LINE_02", "Tetra Pak TBA/19 180ml", "MILO_180ML"),
-        "H": ("LINE_03", "SIG Combibloc CFA 312", "NESTLE_PURE_250ML")
+    df["Product ID"] = df["Product ID"].astype("string").str.strip()
+    df["Type"] = df["Type"].astype("string").str.strip()
+
+    duplicate_exact = df.duplicated(keep="first")
+    exact_duplicates_removed = int(duplicate_exact.sum())
+    df = df.loc[~duplicate_exact].copy()
+
+    reasons = pd.Series("", index=df.index, dtype="string")
+
+    def flag(mask: pd.Series, reason: str) -> None:
+        nonlocal reasons
+        mask = mask.fillna(True)
+        reasons.loc[mask] = reasons.loc[mask].apply(
+            lambda old: f"{old}; {reason}" if old else reason
+        )
+
+    required_non_null = [
+        "UDI", "Product ID", "Type", "Air temperature [K]",
+        "Process temperature [K]", "Rotational speed [rpm]",
+        "Torque [Nm]", "Tool wear [min]", *LABEL_COLUMNS,
+    ]
+    flag(df[required_non_null].isna().any(axis=1), "missing_or_non_numeric_required_value")
+    flag(~df["Type"].isin(["L", "M", "H"]), "invalid_product_type")
+
+    invalid_label = pd.Series(False, index=df.index)
+    for col in LABEL_COLUMNS:
+        invalid_label |= ~df[col].isin([0, 1])
+    flag(invalid_label, "failure_label_not_binary")
+
+    flag(
+        (df["UDI"] <= 0)
+        | (df["UDI"] % 1 != 0),
+        "invalid_udi",
+    )
+    flag(
+        (df["Air temperature [K]"] <= 0)
+        | (df["Process temperature [K]"] <= 0)
+        | (df["Rotational speed [rpm]"] <= 0)
+        | (df["Torque [Nm]"] < 0)
+        | (df["Tool wear [min]"] < 0),
+        "sensor_value_out_of_basic_domain",
+    )
+    flag(
+        df["UDI"].notna() & df["UDI"].duplicated(keep=False),
+        "duplicate_udi",
+    )
+
+    # Avoid using hard-coded physical limits to delete unusual but potentially
+    # valid benchmark values. Those should be examined as outliers separately.
+    reject_mask = reasons.ne("")
+    rejected = df.loc[reject_mask].copy()
+    rejected["rejection_reason"] = reasons.loc[reject_mask]
+    clean = df.loc[~reject_mask].copy()
+
+    clean["UDI"] = clean["UDI"].astype("int64")
+    for col in LABEL_COLUMNS:
+        clean[col] = clean[col].astype("int8")
+
+    reason_counts: dict[str, int] = {}
+    if not rejected.empty:
+        reason_counts = (
+            rejected["rejection_reason"]
+            .str.split("; ")
+            .explode()
+            .value_counts()
+            .astype(int)
+            .to_dict()
+        )
+
+    report = {
+        "dataset": "AI4I 2020 Predictive Maintenance Dataset",
+        "data_provenance": "public benchmark; not live Nestle factory telemetry",
+        "rows_input": int(rows_input),
+        "exact_duplicates_removed": exact_duplicates_removed,
+        "rows_after_exact_deduplication": int(len(df)),
+        "rows_accepted": int(len(clean)),
+        "rows_quarantined": int(len(rejected)),
+        "acceptance_rate": round(len(clean) / len(df), 6) if len(df) else 0.0,
+        "quarantine_reason_counts": reason_counts,
+        "null_counts_accepted_rows": {
+            str(k): int(v) for k, v in clean.isna().sum().to_dict().items()
+        },
+        "machine_failure_count": int(clean["Machine failure"].sum()),
+        "machine_failure_rate": (
+            round(float(clean["Machine failure"].mean()), 6) if len(clean) else 0.0
+        ),
+        "failure_label_counts": {
+            col: int(clean[col].sum()) for col in LABEL_COLUMNS
+        },
     }
+    return clean.reset_index(drop=True), rejected.reset_index(drop=True), report
 
-    df["line_id"] = df["product_type"].map(lambda x: line_map.get(x, ("LINE_01", "", ""))[0])
-    df["machine_name"] = df["product_type"].map(lambda x: line_map.get(x, ("", "", ""))[1])
-    df["sku_profile"] = df["product_type"].map(lambda x: line_map.get(x, ("", "", ""))[2])
 
-    # 2. Xây dựng Chuỗi thời gian liên tục 24/7 (Sampling rate: 1 record / phút)
-    start_time = datetime(2026, 3, 1, 6, 0, 0)  # Bắt đầu từ 06:00 sáng Thứ Hai
-    timestamps = [start_time + timedelta(minutes=i) for i in range(len(df))]
-    df["timestamp"] = timestamps
+def process_telemetry_features(
+    df_raw: pd.DataFrame,
+    start_time: datetime,
+    sample_interval_minutes: int = 1,
+    map_to_nestle_scenario: bool = False,
+) -> pd.DataFrame:
+    """
+    Build analytical features.
+
+    The generated timestamp is a synthetic ordering timeline because AI4I
+    does not contain actual timestamps. The default type mapping remains
+    benchmark-oriented unless the illustrative mapping flag is enabled.
+    """
+    if sample_interval_minutes <= 0:
+        raise ValueError("sample_interval_minutes must be positive")
+
+    df = df_raw.copy()
+    df = df.sort_values("UDI").reset_index(drop=True)
+
+    rename_map = {
+        "UDI": "record_id",
+        "Product ID": "product_code",
+        "Type": "product_type",
+        "Air temperature [K]": "raw_air_k",
+        "Process temperature [K]": "raw_proc_k",
+        "Rotational speed [rpm]": "speed_servo_rpm",
+        "Torque [Nm]": "tension_torque_nm",
+        "Tool wear [min]": "cutting_knife_wear_min",
+    }
+    df = df.rename(columns=rename_map)
+
+    if map_to_nestle_scenario:
+        line_map = ILLUSTRATIVE_NESTLE_MAP
+        df["line_id"] = df["product_type"].map(lambda x: line_map[x][0])
+        df["machine_name"] = df["product_type"].map(lambda x: line_map[x][1])
+        df["sku_profile"] = df["product_type"].map(lambda x: line_map[x][2])
+        mapping_mode = "illustrative_nestle_scenario_not_verified"
+    else:
+        df["line_id"] = df["product_type"].map(lambda x: f"AI4I_TYPE_{x}")
+        df["machine_name"] = df["product_type"].map(lambda x: f"AI4I benchmark type {x}")
+        df["sku_profile"] = df["product_type"].map(lambda x: f"AI4I_TYPE_{x}")
+        mapping_mode = "benchmark_type_only"
+
+    df["timestamp"] = [
+        start_time + timedelta(minutes=i * sample_interval_minutes)
+        for i in range(len(df))
+    ]
     df["timestamp_str"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    # 3. Phân bổ Ca làm việc
+    df["timestamp_is_synthetic"] = True
     df["shift_id"] = df["timestamp"].dt.hour.map(map_shift)
 
-    # 4. Chuyển đổi đơn vị nhiệt học (Kelvin sang Celsius)
-    # Nhiệt độ phòng sạch chiết vô trùng
+    # Kelvin to Celsius. Delta between temperatures has the same numeric
+    # magnitude in Kelvin and Celsius.
     df["temp_cleanroom_c"] = (df["raw_air_k"] - 273.15).round(2)
-    # Nhiệt độ đầu hàn siêu âm Sonotrode / thanh gia nhiệt
     df["temp_sonotrode_c"] = (df["raw_proc_k"] - 273.15).round(2)
 
-    # Ép kiểu dữ liệu cảm biến
-    df["speed_servo_rpm"] = df["speed_servo_rpm"].astype(float)
-    df["tension_torque_nm"] = df["tension_torque_nm"].astype(float)
-    df["cutting_knife_wear_min"] = df["cutting_knife_wear_min"].astype(int)
+    df["speed_servo_rpm"] = pd.to_numeric(df["speed_servo_rpm"], errors="raise").astype(float)
+    df["tension_torque_nm"] = pd.to_numeric(df["tension_torque_nm"], errors="raise").astype(float)
+    df["cutting_knife_wear_min"] = pd.to_numeric(
+        df["cutting_knife_wear_min"], errors="raise"
+    ).astype(int)
 
-    # 5. Feature Engineering:
-    # Feature A: Delta T (°C)
     df["delta_t"] = (df["temp_sonotrode_c"] - df["temp_cleanroom_c"]).round(2)
 
-    # Feature B: dT/dt (°C/min) - Đạo hàm nhiệt độ Sonotrode theo thời gian cho từng dây chuyền
-    df = df.sort_values(by=["line_id", "timestamp"]).reset_index(drop=True)
+    # Difference is calculated within each benchmark type/illustrative line.
+    df = df.sort_values(["line_id", "timestamp"]).reset_index(drop=True)
     df["dt_dt"] = (
         df.groupby("line_id")["temp_sonotrode_c"]
         .diff()
@@ -247,43 +359,39 @@ def process_telemetry_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         .round(3)
     )
 
-    # Feature C: Công suất cơ học trục kéo Servo P_mech (kW)
-    # P = Torque (Nm) * omega (rad/s) / 1000 = (Torque * 2 * pi * RPM) / 60000
+    # P(kW) = Torque(Nm) * 2*pi*RPM / 60000.
     df["p_mech_kw"] = (
-        (df["tension_torque_nm"] * df["speed_servo_rpm"] * 2 * np.pi) / 60000.0
+        df["tension_torque_nm"] * df["speed_servo_rpm"] * 2 * np.pi / 60000.0
     ).round(3)
-
-    # Feature D: Heat Strain Index (HSI) - Chỉ số căng thẳng nhiệt giải nhiệt
     df["heat_strain_index"] = (
         (df["p_mech_kw"] * 100.0) / (df["delta_t"].abs() + 0.1)
     ).round(2)
 
-    # 6. Xử lý Mã lỗi và Mức độ nghiêm trọng
     df["error_code"] = df.apply(map_error_code, axis=1)
-    df["is_failure"] = df["Machine failure"].astype(int)
+    df["is_failure"] = df["Machine failure"].astype("int8")
 
-    # Phân loại mức cảnh báo vận hành
-    def evaluate_severity(row):
+    def evaluate_severity(row: pd.Series) -> str:
         if row["is_failure"] == 1:
             return "CRITICAL"
-        # Cảnh báo sớm: Delta T thấp bất thường (dấu hiệu tắc chiller tản nhiệt)
         if row["delta_t"] < 8.6 and row["speed_servo_rpm"] < 1380:
             return "WARNING"
-        # Cảnh báo sớm: Dao cắt đã chạm ngưỡng mài mòn cao (> 200 phút)
         if row["cutting_knife_wear_min"] >= 200:
             return "WARNING"
-        # Cảnh báo sớm: Công suất Servo tiệm cận ngưỡng quá tải
         if row["p_mech_kw"] > 8.5:
             return "WARNING"
         return "NORMAL"
 
     df["alert_severity"] = df.apply(evaluate_severity, axis=1)
+    df["mapping_mode"] = mapping_mode
+    df["data_source"] = "AI4I_2020_benchmark"
 
-    # 7. Sắp xếp lại thứ tự cột chuẩn Enterprise Data Schema
     output_columns = [
         "record_id",
+        "product_code",
+        "product_type",
         "timestamp",
         "timestamp_str",
+        "timestamp_is_synthetic",
         "shift_id",
         "line_id",
         "machine_name",
@@ -299,84 +407,112 @@ def process_telemetry_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         "heat_strain_index",
         "error_code",
         "is_failure",
-        "alert_severity"
+        "TWF",
+        "HDF",
+        "PWF",
+        "OSF",
+        "RNF",
+        "alert_severity",
+        "mapping_mode",
+        "data_source",
     ]
-
-    # Sắp xếp lại dữ liệu theo thời gian tổng thể
-    final_df = df.sort_values(by="timestamp").reset_index(drop=True)[output_columns]
-    return final_df
+    return df.sort_values("timestamp").reset_index(drop=True)[output_columns]
 
 
-def validate_and_export(df: pd.DataFrame):
-    """
-    Kiểm định chất lượng dữ liệu và xuất file Parquet + CSV.
-    """
-    logger.info("Kiểm tra tính toàn vẹn (Data Quality Assurance)...")
+def export_outputs(
+    processed: pd.DataFrame,
+    rejected: pd.DataFrame,
+    report: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "cleaned_telemetry.csv"
+    rejected_path = output_dir / "ai4i_rejected.csv"
+    report_path = output_dir / "ai4i_quality_report.json"
+    parquet_path = output_dir / "cleaned_telemetry.parquet"
 
-    # Kiểm tra Missing Value
-    missing_counts = df.isnull().sum().sum()
-    if missing_counts > 0:
-        logger.error(f"Phát hiện {missing_counts} giá trị Null! Đang xử lý bọc lót...")
-        df.fillna(method="bfill", inplace=True)
-    else:
-        logger.info("Chất lượng dữ liệu: Hoàn hảo (0 missing values).")
+    processed.to_csv(csv_path, index=False)
+    rejected.to_csv(rejected_path, index=False)
+    report["output_rows"] = int(len(processed))
+    report["output_columns"] = list(processed.columns)
+    report["output_timestamp_semantics"] = (
+        "synthetic timeline; AI4I source has no timestamp field"
+    )
+    report["feature_mapping_semantics"] = (
+        "illustrative mapping only; not verified against Nestle factory master data"
+    )
+    report_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
 
-    # Xuất file CSV
-    df.to_csv(OUTPUT_CSV_PATH, index=False)
-    csv_size_mb = os.path.getsize(OUTPUT_CSV_PATH) / (1024 * 1024)
-    logger.info(f"Đã xuất: {OUTPUT_CSV_PATH} ({csv_size_mb:.2f} MB)")
+    logger.info("CSV exported: %s", csv_path)
+    logger.info("Quarantine exported: %s", rejected_path)
+    logger.info("Quality report exported: %s", report_path)
 
-    # Xuất file Parquet (Cột timestamp giữ nguyên kiểu datetime64)
     try:
-        df.to_parquet(OUTPUT_PARQUET_PATH, engine="pyarrow", index=False)
-        parquet_size_mb = os.path.getsize(OUTPUT_PARQUET_PATH) / (1024 * 1024)
-        logger.info(f"Đã xuất: {OUTPUT_PARQUET_PATH} ({parquet_size_mb:.2f} MB)")
-    except Exception as e:
-        logger.warning(f"Lưu ý: Chưa cài pyarrow hoặc lỗi ghi parquet ({e}). Tiến hành fallback CSV an toàn.")
+        processed.to_parquet(parquet_path, engine="pyarrow", index=False)
+        logger.info("Parquet exported: %s", parquet_path)
+    except (ImportError, ModuleNotFoundError):
+        logger.warning("pyarrow is not installed; skipped Parquet output.")
+    except Exception:
+        logger.exception("Parquet export failed; CSV output is still available.")
 
-    # In Bảng Báo Cáo Kỹ Thuật Tổng Hợp (Executive Manufacturing Summary)
-    print("\n" + "=" * 80)
-    print("           BÁO CÁO PIPELINE DỮ LIỆU ĐÓNG GÓI - NHÀ MÁY NESTLÉ ĐỒNG NAI")
-    print("=" * 80)
-    print(f"Tổng số bản ghi telemetry : {len(df):,} records (Tần suất 1 phút/bản ghi)")
-    print(f"Khung thời gian vận hành   : Từ {df['timestamp_str'].iloc[0]} Đến {df['timestamp_str'].iloc[-1]}")
-    print(f"Số ngày sản xuất liên tục : {len(df) / (60 * 24):.2f} ngày")
-    print(f"Tổng số sự cố dừng máy    : {df['is_failure'].sum()} sự cố (Failure rate: {df['is_failure'].mean() * 100:.2f}%)")
-    print("-" * 80)
-    print("PHÂN BỔ SẢN LƯỢNG & SỰ CỐ THEO DÂY CHUYỀN:")
-    line_summary = df.groupby(["line_id", "machine_name"]).agg(
-        total_records=("record_id", "count"),
-        failures=("is_failure", "sum"),
-        avg_power_kw=("p_mech_kw", "mean"),
-        max_sonotrode_temp=("temp_sonotrode_c", "max")
-    ).reset_index()
-    print(line_summary.to_string(index=False))
-
-    print("-" * 80)
-    print("PHÂN BỔ SỰ CỐ THEO CA LÀM VIỆC (SHIFTS):")
-    shift_summary = df.groupby("shift_id").agg(
-        records=("record_id", "count"),
-        failures=("is_failure", "sum"),
-        warning_alerts=("alert_severity", lambda x: (x == "WARNING").sum())
-    ).reset_index()
-    print(shift_summary.to_string(index=False))
-
-    print("-" * 80)
-    print("MA TRẬN MÃ LỖI BẢO TRÌ (ERROR CODES):")
-    error_summary = df[df["error_code"] != "NORMAL"]["error_code"].value_counts().reset_index()
-    error_summary.columns = ["Error Code", "Occurrences"]
-    print(error_summary.to_string(index=False))
-    print("=" * 80 + "\n")
+    if not processed.empty:
+        print("\n" + "=" * 76)
+        print("AI4I ETL QUALITY SUMMARY")
+        print("=" * 76)
+        print(f"Accepted telemetry rows : {len(processed):,}")
+        print(f"Quarantined rows        : {len(rejected):,}")
+        print(f"Failure events          : {int(processed['is_failure'].sum()):,}")
+        print(f"Failure rate            : {processed['is_failure'].mean() * 100:.2f}%")
+        print(f"Timestamp semantics     : synthetic timeline")
+        print(f"Mapping mode            : {processed['mapping_mode'].iloc[0]}")
+        print("=" * 76 + "\n")
 
 
-def main():
-    """Hàm điều phối thực thi ETL."""
-    logger.info("=== BẮT ĐẦU PHA 1: NẠP VÀ XỬ LÝ DỮ LIỆU CÔNG NGHIỆP ===")
-    ensure_directories()
-    raw_df = download_ai4i_dataset()
-    clean_df = process_telemetry_features(raw_df)
-    validate_and_export(clean_df)
-    logger.info("=== HOÀN TẤT PHA 1 XUẤT SẮC ===")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ETL pipeline for AI4I 2020 dataset")
+    parser.add_argument("--input", type=Path, default=DEFAULT_RAW_PATH)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--start-time",
+        default="2026-03-01T06:00:00",
+        help="Start of the synthetic timeline, ISO format; not source telemetry time",
+    )
+    parser.add_argument(
+        "--sample-interval-minutes",
+        type=int,
+        default=1,
+        help="Interval used for generated timestamps; not measured by AI4I",
+    )
+    parser.add_argument(
+        "--map-to-nestle-scenario",
+        action="store_true",
+        help="Apply the illustrative L/M/H-to-Nestle mapping from the original script",
+    )
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Do not download the dataset when the local CSV is missing",
+    )
+    args = parser.parse_args()
+
+    data_dir = args.input.parent
+    ensure_directories(data_dir, args.output_dir)
+    start_time = datetime.fromisoformat(args.start_time)
+
+    logger.info("=== START AI4I ETL ===")
+    raw = download_ai4i_dataset(args.input, allow_download=not args.no_download)
+    clean_source, rejected, report = validate_and_quarantine(raw)
+    processed = process_telemetry_features(
+        clean_source,
+        start_time=start_time,
+        sample_interval_minutes=args.sample_interval_minutes,
+        map_to_nestle_scenario=args.map_to_nestle_scenario,
+    )
+    export_outputs(processed, rejected, report, args.output_dir)
+    logger.info("=== AI4I ETL COMPLETE ===")
 
 
 if __name__ == "__main__":
