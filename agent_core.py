@@ -92,7 +92,7 @@ class PackagingCopilotAgent:
         t_sono = sensor_state.get("temp_sonotrode_c", 0.0)
         delta_t = sensor_state.get("delta_t", 0.0)
         p_kw = sensor_state.get("p_mech_kw", 0.0)
-        knife = sensor_state.get("cutting_knife_wear_min", 0)
+        knife = sensor_state.get("cutting_knife_wear_m", 0)
         rpm = sensor_state.get("speed_servo_rpm", 0.0)
         torque = sensor_state.get("tension_torque_nm", 0.0)
         rec_id = sensor_state.get("record_id", 0)

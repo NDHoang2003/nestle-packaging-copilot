@@ -111,10 +111,13 @@ class StochasticPackagingLineSimulator:
         if is_failure:
             return error_code, "CRITICAL"
 
+        if error_code != "NORMAL":
+            return error_code, "WARNING"
+
         if actual_speed <= 18000:
             return error_code, "WARNING"
 
-        return error_code, "NORMAL"
+        return "NORMAL", "NORMAL"
 
     def _persist_telemetry(
         self,
