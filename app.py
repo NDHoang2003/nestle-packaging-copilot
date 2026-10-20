@@ -45,98 +45,259 @@ st.markdown("""
 
 
 # ==============================================================================
-# HÀM GHI NHẬT KÝ AN TOÀN TUYỆT ĐỐI (CHỐNG MỌI LỖI KEYERROR)
+# SHIFT LOG
 # ==============================================================================
 def append_shift_log(message: str):
-    """Ghi log ca trực an toàn, tự động khởi tạo nếu session state bị thiếu key."""
+    """Append to the UI session log while defending against missing state."""
     if "shift_log" not in st.session_state or not isinstance(st.session_state["shift_log"], list):
         st.session_state["shift_log"] = []
     st.session_state["shift_log"].append(message)
 
 
 # ==============================================================================
-# HÀM DATABASE THAO TÁC THỰC
+# DATABASE HELPERS
 # ==============================================================================
 def get_part_stock(target_part_pattern: str) -> int:
+    conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
         cursor = conn.cursor()
-        cursor.execute("SELECT stock_quantity FROM dim_spare_parts WHERE part_id LIKE ? LIMIT 1", (f"%{target_part_pattern}%",))
+        cursor.execute(
+            "SELECT stock_quantity FROM dim_spare_parts WHERE part_id LIKE ? LIMIT 1",
+            (f"%{target_part_pattern}%",),
+        )
         row = cursor.fetchone()
-        conn.close()
         return int(row[0]) if row else 0
-    except Exception:
+    except sqlite3.Error:
+        # Do not report a fabricated stock value as though the query succeeded.
         return 0
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def restock_all_spare_parts():
+    conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE dim_spare_parts SET stock_quantity = stock_quantity + 10")
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.execute("UPDATE dim_spare_parts SET stock_quantity = stock_quantity + 10")
         conn.commit()
-        conn.close()
-    except Exception:
-        pass
+        return True
+    except sqlite3.Error:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
-def create_app_work_order(machine_id, error_code, summary):
+def create_app_work_order(machine_id, error_code, summary, downtime_duration_minutes=0.0, existing_event_id=None):
+    """Create a downtime/event record and linked work order atomically.
+
+    The current schema requires downtime.record_id and work_order.event_id.
+    A work order cannot be created if no telemetry row exists to link it to.
+    """
+    conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.execute("PRAGMA foreign_keys = ON")
         cursor = conn.cursor()
         now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        wo_id = f"WO-APP-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        wo_id = f"WO-APP-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
+        if existing_event_id is None:
+            cursor.execute("""
+                INSERT INTO fact_downtime_events (
+                    record_id, line_id, timestamp, shift_id, error_code,
+                    downtime_duration_minutes, impact_units_lost
+                )
+                SELECT record_id, ?, ?, ?, ?, ?, ?
+                FROM fact_sensor_telemetry
+                WHERE line_id = ?
+                ORDER BY record_id DESC
+                LIMIT 1
+            """, (machine_id, now_ts, "Shift 1", error_code,
+                    float(downtime_duration_minutes), int(float(downtime_duration_minutes) * 400), machine_id))
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"Cannot create work order for {machine_id}: no telemetry row exists to link."
+                )
+            event_id = cursor.lastrowid
+        else:
+            cursor.execute("""
+                SELECT event_id FROM fact_downtime_events
+                WHERE event_id = ? AND line_id = ?
+            """, (existing_event_id, machine_id))
+            if cursor.fetchone() is None:
+                raise RuntimeError(f"Cannot link work order: event {existing_event_id} does not exist for {machine_id}.")
+            event_id = existing_event_id
+
         cursor.execute("""
             INSERT INTO fact_work_orders (
-                work_order_id, line_id, error_code, created_at,
+                work_order_id, event_id, line_id, error_code, created_at,
                 priority, loto_status, technician_assigned, resolution_notes, order_status
-            ) VALUES (?, ?, ?, ?, 'P1_URGENT', 'LOTO_REQUIRED', 'Nguyễn Doãn Hoàng (KTV Ca 1)', ?, 'OPEN')
-        """, (wo_id, machine_id, error_code, now_ts, summary))
+            ) VALUES (?, ?, ?, ?, ?, 'P1_URGENT', 'LOTO_REQUIRED',
+                      'Nguyễn Doãn Hoàng (KTV Ca 1)', ?, 'OPEN')
+        """, (wo_id, event_id, machine_id, error_code, now_ts, summary))
         conn.commit()
-        conn.close()
-        return wo_id
+        return wo_id, event_id
     except Exception:
-        return f"WO-{datetime.now().strftime('%H%M%S')}"
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def close_app_work_order(work_order_id, technician_name):
+    """Close only the supplied open work order; never bulk-close other orders."""
+    if not work_order_id:
+        raise ValueError("Cannot close work order: no work_order_id was supplied.")
+    conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.execute("PRAGMA foreign_keys = ON")
         cursor = conn.cursor()
         now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor.execute("""
             UPDATE fact_work_orders
             SET order_status = 'CLOSED', loto_status = 'RESTORED',
                 closed_at = ?, technician_assigned = ?
-            WHERE work_order_id = ? OR order_status = 'OPEN'
+            WHERE work_order_id = ? AND order_status = 'OPEN'
         """, (now_ts, technician_name, work_order_id))
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Work order {work_order_id!r} was not updated; verify its ID and status."
+            )
         conn.commit()
-        conn.close()
     except Exception:
-        pass
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def update_downtime_event(event_id, duration_mins, machine_id, error_code, work_order_id=None):
+    """Update the existing incident row when an AMBER incident escalates to RED."""
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE fact_downtime_events
+            SET downtime_duration_minutes = ?, impact_units_lost = ?, error_code = ?
+            WHERE event_id = ? AND line_id = ?
+        """, (float(duration_mins), int(float(duration_mins) * 400), error_code, event_id, machine_id))
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"Cannot update downtime event {event_id}: event not found for {machine_id}.")
+        if work_order_id:
+            cursor.execute("""
+                UPDATE fact_work_orders
+                SET error_code = ?
+                WHERE work_order_id = ? AND event_id = ? AND line_id = ? AND order_status = 'OPEN'
+            """, (error_code, work_order_id, event_id, machine_id))
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Cannot synchronize Work Order {work_order_id} with RED event {event_id}.")
+        conn.commit()
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def record_downtime_event(machine_id, error_code, root_cause, duration_mins=15.0):
+    """Persist downtime linked to the latest telemetry row for this line.
+
+    root_cause is included in the signature for caller compatibility; this
+    schema version has no root_cause column in fact_downtime_events.
+    """
+    conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.execute("PRAGMA foreign_keys = ON")
         cursor = conn.cursor()
         now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # error_code is a foreign key. PLANNED_PM is not present in the
+        # current catalog, so resolve unknown codes to the latest telemetry
+        # code until the schema includes a dedicated planned-maintenance code.
+        cursor.execute(
+            "SELECT 1 FROM dim_error_catalog WHERE error_code = ? LIMIT 1",
+            (error_code,),
+        )
+        if cursor.fetchone() is None:
+            cursor.execute("""
+                SELECT error_code
+                FROM fact_sensor_telemetry
+                WHERE line_id = ?
+                ORDER BY record_id DESC
+                LIMIT 1
+            """, (machine_id,))
+            latest = cursor.fetchone()
+            if latest is None:
+                raise RuntimeError(
+                    f"Cannot record downtime for {machine_id}: no telemetry row exists to link."
+                )
+            error_code = latest[0]
+
         cursor.execute("""
             INSERT INTO fact_downtime_events (
-                line_id, timestamp, shift_id, error_code, downtime_duration_minutes, impact_units_lost
-            ) VALUES (?, ?, 'Shift 1', ?, ?, ?)
-        """, (machine_id, now_ts, error_code, duration_mins, int(duration_mins * 400)))
+                record_id, line_id, timestamp, shift_id, error_code,
+                downtime_duration_minutes, impact_units_lost
+            )
+            SELECT record_id, ?, ?, ?, ?, ?, ?
+            FROM fact_sensor_telemetry
+            WHERE line_id = ?
+            ORDER BY record_id DESC
+            LIMIT 1
+        """, (
+            machine_id, now_ts, "Shift 1", error_code,
+            duration_mins, int(duration_mins * 400), machine_id
+        ))
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"Cannot record downtime for {machine_id}: no telemetry row exists to link."
+            )
         conn.commit()
-        conn.close()
     except Exception:
-        pass
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # ==============================================================================
-# KHỞI TẠO STATE AN TOÀN
+# SAFE SESSION INITIALIZATION
 # ==============================================================================
 if "shift_log" not in st.session_state:
     st.session_state["shift_log"] = []
+
+# A simulated PLC register is process-local RAM, not persisted machine state.
+# On first bootstrap of this UI session, clear an orphaned interlock only when
+# there is no active incident/WO in session state. A live RED incident remains latched.
+if "plc_session_initialized" not in st.session_state:
+    has_active_incident = bool(
+        st.session_state.get("red_latched", False)
+        or st.session_state.get("current_wo_id")
+        or st.session_state.get("current_event_id")
+    )
+    if not has_active_incident:
+        plc_bridge.write_holding_register(
+            "LINE_01", PLCHoldingRegisters.REG_CURRENT_ACTUAL_SPEED, 24000
+        )
+        plc_bridge.write_holding_register(
+            "LINE_01", PLCHoldingRegisters.REG_SAFETY_INTERLOCK, 0
+        )
+    st.session_state["plc_session_initialized"] = True
 
 if "sim" not in st.session_state or not hasattr(st.session_state["sim"], "fault_mode"):
     st.session_state["sim"] = StochasticPackagingLineSimulator(machine_id="LINE_01")
@@ -153,6 +314,18 @@ if "active_sap_slip" not in st.session_state:
 if "current_wo_id" not in st.session_state:
     st.session_state["current_wo_id"] = None
 
+if "current_event_id" not in st.session_state:
+    st.session_state["current_event_id"] = None
+
+if "red_latched" not in st.session_state:
+    st.session_state["red_latched"] = False
+
+if "red_event_persisted" not in st.session_state:
+    st.session_state["red_event_persisted"] = False
+
+if "maintenance_stop_latched" not in st.session_state:
+    st.session_state["maintenance_stop_latched"] = False
+
 if "derate_seconds_count" not in st.session_state:
     st.session_state["derate_seconds_count"] = 0
 
@@ -165,7 +338,13 @@ if len(st.session_state["shift_log"]) == 0:
 
 
 def advance_simulation_step(num_steps: int = 1):
+    if st.session_state.get("red_latched", False):
+        append_shift_log("RED đang được giữ chốt: cần hoàn tất bảo trì mô phỏng trước khi chạy tiếp.")
+        return
+
     for _ in range(num_steps):
+        if st.session_state.get("red_latched", False):
+            break
         frame = sim.step()
         st.session_state["latest_frame"] = frame
 
@@ -185,8 +364,9 @@ def advance_simulation_step(num_steps: int = 1):
 
         current_f = frame.get("fault_mode", getattr(sim, "fault_mode", "CUTTER_WEAR"))
 
-        # KHI GẶP AMBER
-        if (assessment.state == DegradationState.AMBER or frame["actual_speed_cph"] == 18000) and st.session_state["active_sap_slip"] is None:
+        # EARLY WARNING / AMBER: reserve stock once; retry a failed WO write without reserving again.
+        amber_triggered = assessment.state == DegradationState.AMBER or frame["actual_speed_cph"] == 18000
+        if amber_triggered and st.session_state.get("current_wo_id") is None:
             if current_f == "CHILLER_OVERHEAT" or frame["ultrasonic_temp_c"] >= 38.5:
                 err_code = "E-105"
                 part_type = "JAW"
@@ -200,31 +380,68 @@ def advance_simulation_step(num_steps: int = 1):
                 part_type = "CUT"
                 reason_txt = f"Dao cắt màng mòn tiệm cận ngưỡng: {frame['cutting_knife_wear_m']}m"
 
-            execute_line_derate("LINE_01", 18000, reason_txt)
+            derate_result = execute_line_derate("LINE_01", 18000, reason_txt)
+            execution = derate_result.get("execution_result", {})
+            if execution.get("status") != "SUCCESS":
+                raise RuntimeError(
+                    f"Line derate was not confirmed: {execution.get('status', 'unknown status')}"
+                )
 
-            sap_res = reserve_sap_spare_part("LINE_01", part_type)
-            st.session_state["active_sap_slip"] = sap_res.get("requisition_slip")
-            shelf = st.session_state["active_sap_slip"].get("shelf_location") if st.session_state["active_sap_slip"] else "Kho chính"
+            if st.session_state.get("active_sap_slip") is None:
+                sap_res = reserve_sap_spare_part("LINE_01", part_type)
+                slip = sap_res.get("requisition_slip")
+                if not slip:
+                    raise RuntimeError(
+                        f"Spare-part reservation not confirmed: {sap_res.get('message', sap_res.get('status', 'unknown error'))}"
+                    )
+                # Store immediately after confirmed reservation so a WO write failure cannot reserve twice.
+                st.session_state["active_sap_slip"] = slip
+            slip = st.session_state["active_sap_slip"]
+            shelf = slip.get("shelf_location", "Kho chính")
 
-            wo_id = create_app_work_order("LINE_01", err_code, f"[COPILOT INTERVENTION]: {reason_txt}. Lấy phụ tùng tại {shelf}.")
+            wo_id, event_id = create_app_work_order("LINE_01", err_code, f"[COPILOT INTERVENTION]: {reason_txt}. Lấy phụ tùng tại {shelf}.")
             st.session_state["current_wo_id"] = wo_id
+            st.session_state["current_event_id"] = event_id
 
             roi_engine.compute_intervention_roi("LINE_01", "AMBER_AUTONOMOUS_INTERVENTION", wo_id)
-
             append_shift_log(
-                f"{datetime.now().strftime('%H:%M:%S')} - ⚠️ CẢNH BÁO AMBER ({err_code}): Copilot hạ tốc độ 18k cph, tạo phiếu {wo_id}, xuất kho tại {shelf}."
+                f"{datetime.now().strftime('%H:%M:%S')} - CẢNH BÁO AMBER ({err_code}): mô phỏng hạ tốc 18k cph, tạo phiếu {wo_id}, phụ tùng tại {shelf}."
             )
 
-        # KHI GẶP RED: GHI DOWNTIME THẬT VÀ GHI LOG AN TOÀN
+        # RED: latch once, stop further simulation steps, and persist one incident only.
         if assessment.state == DegradationState.RED or frame["is_failure"] == 1:
+            st.session_state["red_latched"] = True
             err = "E-204" if current_f == "CUTTER_WEAR" else ("E-105" if current_f == "CHILLER_OVERHEAT" else "E-302")
-            record_downtime_event("LINE_01", err, f"Sập máy khẩn cấp: {', '.join(assessment.drift_reasons) if assessment.drift_reasons else 'Chạm ngưỡng tới hạn vật lý'}", duration_mins=30.0)
-            append_shift_log(
-                f"{datetime.now().strftime('%H:%M:%S')} - 🛑 SẬP MÁY RED ({err}): Ghi nhận 30 phút dừng máy vào fact_downtime_events!"
-            )
+            cause = f"Sập máy khẩn cấp: {', '.join(assessment.drift_reasons) if assessment.drift_reasons else 'Chạm ngưỡng tới hạn vật lý'}"
+            try:
+                existing_event_id = st.session_state.get("current_event_id")
+                if existing_event_id:
+                    wo_id = st.session_state.get("current_wo_id")
+                    if not wo_id:
+                        wo_id, _ = create_app_work_order(
+                            "LINE_01", err, f"[RED INCIDENT]: {cause}", existing_event_id=existing_event_id
+                        )
+                        st.session_state["current_wo_id"] = wo_id
+                    update_downtime_event(existing_event_id, 30.0, "LINE_01", err, wo_id)
+                else:
+                    wo_id, event_id = create_app_work_order(
+                        "LINE_01", err, f"[RED INCIDENT]: {cause}", downtime_duration_minutes=30.0
+                    )
+                    st.session_state["current_wo_id"] = wo_id
+                    st.session_state["current_event_id"] = event_id
+                st.session_state["red_event_persisted"] = True
+                append_shift_log(
+                    f"{datetime.now().strftime('%H:%M:%S')} - SẬP MÁY RED ({err}): giữ chốt RED; downtime 30 phút gắn với event #{st.session_state.get('current_event_id')}; Work Order {st.session_state.get('current_wo_id')}."
+                )
+            except Exception as exc:
+                st.session_state["red_event_persisted"] = False
+                append_shift_log(
+                    f"{datetime.now().strftime('%H:%M:%S')} - RED đã giữ chốt nhưng ghi nhận nghiệp vụ thất bại: {exc}"
+                )
+            break
 
 
-# Khởi tạo frame ban đầu nếu chưa có
+# Initial frame. Simulator persistence failure raises rather than showing a fake frame.
 if "latest_frame" not in st.session_state:
     st.session_state["latest_frame"] = sim.step()
 
@@ -233,198 +450,235 @@ if "assessment" not in st.session_state:
 
 latest_frame = st.session_state["latest_frame"]
 assessment = st.session_state["assessment"]
-current_speed = plc_bridge.read_holding_register("LINE_01", PLCHoldingRegisters.REG_CURRENT_ACTUAL_SPEED) or 24000
+current_speed_reading = plc_bridge.read_holding_register("LINE_01", PLCHoldingRegisters.REG_CURRENT_ACTUAL_SPEED)
 is_interlocked = (plc_bridge.read_holding_register("LINE_01", PLCHoldingRegisters.REG_SAFETY_INTERLOCK) == 1)
+# An asserted interlock means actual line speed is zero, even if the simulated
+# PLC's last speed register still contains the previous limp-home setpoint.
+current_speed = 0 if is_interlocked else (24000 if current_speed_reading is None else current_speed_reading)
 
 # Header
-st.markdown("### 🏭 NESTLÉ ĐỒNG NAI — PACKAGING COPILOT HMI")
+st.markdown("### 🏭 PACKAGING COPILOT — SIMULATED LINE_01")
+st.caption("Prototype giao diện cho dây chuyền mô phỏng; không phải HMI đã kết nối thiết bị Nestlé.")
 
 current_fault = latest_frame.get("fault_mode", getattr(sim, "fault_mode", "CUTTER_WEAR"))
 part_key = "CUT" if current_fault == "CUTTER_WEAR" else ("JAW" if current_fault == "CHILLER_OVERHEAT" else "BELT")
 current_warehouse_stock = get_part_stock(part_key)
 
-st.caption(f"Trạm Tác Nghiệp Kỹ Thuật Viên Ca | LINE_01 | Trục trặc tiềm ẩn ca này: **{current_fault}** | Tồn kho phụ tùng: **{current_warehouse_stock} bộ**")
+st.caption(f"Trạm Tác Nghiệp Kỹ Thuật Viên | LINE_01 | Kịch bản mô phỏng: **{current_fault}** | Tồn kho demo: **{current_warehouse_stock} bộ**")
 
-# TRẠNG THÁI DÂY CHUYỀN
-is_red_state = is_interlocked or assessment.state == DegradationState.RED or latest_frame.get("is_failure") == 1
+is_red_state = st.session_state.get("red_latched", False) or is_interlocked or assessment.state == DegradationState.RED or latest_frame.get("is_failure") == 1
 is_amber_state = (current_speed <= 18000 or assessment.state == DegradationState.AMBER) and not is_red_state
 
 if is_red_state:
-    badge_html = '<span class="badge-red">🔴 SẬP MÁY / INTERLOCK KHÓA</span>'
+    badge_html = '<span class="badge-red">RED — INTERLOCK MÔ PHỎNG</span>'
 elif is_amber_state:
-    badge_html = '<span class="badge-amber">🟡 CHẠY CẦM CHỪNG (LIMP-HOME 18.000 CPH)</span>'
+    badge_html = '<span class="badge-amber">AMBER — LIMP-HOME 18.000 CPH</span>'
 else:
-    badge_html = '<span class="badge-green">🟢 CHẠY ĐỊNH MỨC (24.000 CPH)</span>'
+    badge_html = '<span class="badge-green">GREEN — 24.000 CPH (MÔ PHỎNG)</span>'
 
-st.markdown(f"**Tình trạng Dây chuyền:** {badge_html} &nbsp;&nbsp;|&nbsp;&nbsp; Điểm suy thoái AI: **{assessment.degradation_score}%**", unsafe_allow_html=True)
+st.markdown(f"**Trạng thái mô phỏng:** {badge_html} &nbsp;&nbsp;|&nbsp;&nbsp; Điểm suy thoái: **{assessment.degradation_score}%**", unsafe_allow_html=True)
 st.markdown("<br>", unsafe_allow_html=True)
 
-# 1. Đồng Hồ Đo Telemetry
+# 1. Telemetry KPIs
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.metric(label="Tốc Độ Đóng Gói (PLC)", value=f"{current_speed:,} cph")
+    st.metric(label="Tốc độ mô phỏng", value=f"{current_speed:,} cph")
 with c2:
     wear_m = latest_frame["cutting_knife_wear_m"]
-    st.metric(label="Độ Mòn Dao Cắt", value=f"{wear_m:.1f} m")
+    st.metric(label="Độ mòn dao cắt", value=f"{wear_m:.1f} m")
 with c3:
-    st.metric(label="Công Suất Cơ P_mech", value=f"{latest_frame['p_mech_kw']:.2f} kW")
+    st.metric(label="Công suất cơ P_mech", value=f"{latest_frame['p_mech_kw']:.2f} kW")
 with c4:
     temp_c = latest_frame["ultrasonic_temp_c"]
-    st.metric(
-        label="Nhiệt Độ Sonotrode", 
-        value=f"{temp_c:.1f} °C", 
-        delta="An toàn <=40°C" if temp_c <= 40 else "QUÁ NHIỆT (>40°C)",
-        delta_color="normal" if temp_c <= 40 else "inverse"
-    )
+    st.metric(label="Nhiệt độ Sonotrode", value=f"{temp_c:.1f} °C", delta="Trong giới hạn demo ≤40°C" if temp_c <= 40 else "QUÁ NHIỆT (>40°C)", delta_color="normal" if temp_c <= 40 else "inverse")
 
 st.progress(min(wear_m / 140.0, 1.0))
-st.caption(f"Thanh đo mài mòn dao: **{wear_m:.1f}m / 140.0m**")
-
+st.caption(f"Thanh đo mài mòn dao (ngưỡng mô hình): **{wear_m:.1f}m / 140.0m**")
 st.markdown("---")
 
-# 2. Điều Khiển Vận Hành
-st.markdown("##### 🎛️ Bảng Điều Khiển Vận Hành Dây Chuyền")
+# 2. Simulation controls
+st.markdown("##### Bảng điều khiển dây chuyền mô phỏng")
 btn1, btn2, btn3, btn4 = st.columns([1, 1, 1, 1])
-
 with btn1:
-    if st.button("▶ Bước 1 Giây Vận Hành"):
+    if st.button("▶ Bước 1 giây", disabled=is_red_state):
         advance_simulation_step(1)
         st.rerun()
-
 with btn2:
-    if st.button("⏩ Bước 5 Giây (Tua Nhanh)"):
+    if st.button("⏩ Bước 5 giây", disabled=is_red_state):
         advance_simulation_step(5)
         st.rerun()
-
 with btn3:
-    if st.button("🔄 Đổi Ca / Ngẫu Nhiên Mới"):
+    if st.button("🔄 Đổi kịch bản / ca mới", disabled=is_red_state or bool(st.session_state.get("current_wo_id"))):
         sim.replace_part_and_reset()
         st.session_state["active_sap_slip"] = None
+        st.session_state["current_wo_id"] = None
+        st.session_state["current_event_id"] = None
+        st.session_state["red_latched"] = False
+        st.session_state["red_event_persisted"] = False
+        st.session_state["maintenance_stop_latched"] = False
         st.session_state["derate_seconds_count"] = 0
         st.session_state["detector"] = DegradationDetector(window_size=15)
         st.session_state["latest_frame"] = sim.step()
-        new_mode = getattr(st.session_state['sim'], 'fault_mode', 'CUTTER_WEAR')
-        append_shift_log(f"{datetime.now().strftime('%H:%M:%S')} - Bắt đầu ca mới. Điểm yếu tiềm ẩn: {new_mode}")
+        new_mode = getattr(st.session_state["sim"], "fault_mode", "CUTTER_WEAR")
+        append_shift_log(f"{datetime.now().strftime('%H:%M:%S')} - Bắt đầu kịch bản mới. Chế độ: {new_mode}")
         st.rerun()
-
 with btn4:
-    if st.button("📥 Nhập Kho SAP (+10 Bộ)"):
-        restock_all_spare_parts()
-        st.success("Đã nhập thêm +10 bộ phụ tùng vào kho SAP PM!")
-        append_shift_log(f"{datetime.now().strftime('%H:%M:%S')} - KTV nhập kho khẩn cấp +10 bộ linh kiện SAP PM.")
-        st.rerun()
+    if st.button("📥 Nhập kho demo (+10)"):
+        try:
+            restock_all_spare_parts()
+        except sqlite3.Error as exc:
+            st.error(f"Không thể cập nhật tồn kho demo: {exc}")
+        else:
+            st.success("Đã cộng thêm 10 bộ vào catalog phụ tùng SQLite của prototype.")
+            append_shift_log(f"{datetime.now().strftime('%H:%M:%S')} - Tăng tồn kho demo +10.")
+            st.rerun()
 
-# BẢNG TÍNH TOÁN KINH TẾ
+# Scenario economics; explicitly labeled as a model, not realized savings.
 if st.session_state["derate_seconds_count"] > 0:
     secs = st.session_state["derate_seconds_count"]
     speed_loss_vnd = int(secs * (6000 / 3600) * 8000)
     net_avoidance_vnd = max(0, 103500000 - speed_loss_vnd - 9600000)
     st.info(f"""
-    ⏱️ **Theo dõi Chi phí Chạy Cầm Chừng (Limp-Home):** Đã chạy chậm trong **{secs} giây**. 
-    - 📉 Tổn thất do giảm tốc (-6k cph): **-{speed_loss_vnd:,.0f} VNĐ** (chấp nhận được để cứu cuộn giấy).
-    - 💎 **Giá trị bảo toàn ròng so với sập máy 30p:** **+{net_avoidance_vnd:,.0f} VNĐ**!
+    **Mô hình chi phí limp-home (kịch bản, không phải saving thực tế):** đã chạy chậm **{secs} giây**.
+    - Tổn thất ước tính do giảm tốc: **-{speed_loss_vnd:,.0f} VNĐ**.
+    - Giá trị bảo toàn ròng theo giả định trong code: **+{net_avoidance_vnd:,.0f} VNĐ**.
     """)
 
 st.markdown("---")
-
-# 3. Chỉ Dẫn Copilot & Phiếu SAP
 col_left, col_right = st.columns([1, 1])
-
 with col_left:
-    st.markdown("##### 🤖 Trợ Lý Copilot Túc Trực Hiện Trường")
+    st.markdown("##### Copilot — gợi ý cho kỹ thuật viên")
     if is_red_state:
         st.error(f"""
-        **MÁY ĐÃ SẬP ĐỘT NGỘT (UNPLANNED DOWNTIME):**
-        - Lý do: {', '.join(assessment.drift_reasons) if assessment.drift_reasons else 'Vượt giới hạn cơ nhiệt tới hạn'}
-        - Đã tự động ghi nhận 30 phút dừng máy vào bảng `fact_downtime_events`.
-        - Bắt buộc kiểm tra LOTO trước khi thay thế.
+        **RED — dừng bảo vệ trong mô hình**
+        - Lý do: {', '.join(assessment.drift_reasons) if assessment.drift_reasons else 'Vượt ngưỡng mô hình'}
+        - RED được giữ chốt đến khi hoàn tất bảo trì mô phỏng; không thể tiếp tục bước mô phỏng hoặc đổi kịch bản.
+        - {('Đã lưu event downtime và Work Order liên kết.' if st.session_state.get('red_event_persisted') else 'Chưa xác nhận lưu event downtime/Work Order; xem nhật ký để biết lỗi ghi dữ liệu.')}
+        - Quy trình LOTO sản xuất thật phải theo quy định EHS đã phê duyệt.
         """)
     elif is_amber_state:
         st.warning(f"""
-        **CẢNH BÁO SỚM (LIMP-HOME HOẠT ĐỘNG):**
-        - Dây chuyền đang chạy giảm tải **18.000 cph** để chờ Kỹ thuật viên.
-        - **Work Order kích hoạt:** `{st.session_state.get('current_wo_id')}` trong Database.
-        - **Khuyến nghị KTV:** Khẩn trương lấy phụ tùng và ấn 'Dừng máy chủ động' trước khi thông số chạm ngưỡng đỏ RED!
+        **AMBER — cảnh báo trong mô hình**
+        - Tốc độ mô phỏng: **18.000 cph**.
+        - Work Order gần nhất: `{st.session_state.get('current_wo_id')}`.
+        - Khuyến nghị demo: xem phiếu phụ tùng, chủ động dừng và giải thích lý do kỹ thuật.
         """)
     else:
-        st.success("**DÂY CHUYỀN HOẠT ĐỘNG ỔN ĐỊNH:** Tốc độ 24.000 cph định mức.")
+        st.success("**Mô hình đang ở trạng thái GREEN:** tốc độ danh định mô phỏng 24.000 cph.")
 
 with col_right:
-    st.markdown("##### 📦 Phiếu Lĩnh Phụ Tùng SAP PM Tương Ứng")
+    st.markdown("##### Phiếu phụ tùng — catalog demo SQLite")
     slip = st.session_state["active_sap_slip"]
     if slip and is_amber_state:
         st.markdown(f"""
         <div style="background-color: #1A2230; border: 1px dashed #D9822B; border-radius: 8px; padding: 14px;">
-            <b style="color: #ECC94B;">📋 MÃ PHIẾU SAP: {slip.get('requisition_id')}</b>
+            <b style="color: #ECC94B;">MÃ PHIẾU: {slip.get('requisition_id')}</b>
             <div style="font-size: 13px; margin-top: 6px; line-height: 1.6;">
                 <div>Linh kiện: <b>{slip.get('part_name')}</b></div>
-                <div>Mã số SAP: <code>{slip.get('sap_material_code')}</code></div>
-                <div>Vị trí lấy hàng: <b style="color: #48BB78; font-size: 15px;">{slip.get('shelf_location')}</b></div>
-                <div>Tồn kho: <b>{current_warehouse_stock} bộ</b> | Đơn giá: <b>{slip.get('unit_cost_vnd'):,.0f} VNĐ</b></div>
+                <div>Mã vật tư: <code>{slip.get('sap_material_code')}</code></div>
+                <div>Vị trí kệ demo: <b style="color: #48BB78; font-size: 15px;">{slip.get('shelf_location')}</b></div>
+                <div>Tồn kho: <b>{slip.get('remaining_warehouse_stock', current_warehouse_stock)} bộ</b> | Đơn giá catalog: <b>{slip.get('unit_cost_vnd', 0):,.0f} VNĐ</b></div>
             </div>
         </div>
         """, unsafe_allow_html=True)
     else:
-        st.info("Chưa có phiếu xuất kho. Khi phát hiện suy thoái, Copilot sẽ tự động điều phối đúng loại linh kiện.")
+        st.info("Chưa có phiếu phụ tùng. Khi detector kích hoạt luồng AMBER, prototype sẽ tra catalog nội bộ.")
 
 st.markdown("---")
-
-# 4. Thao Tác Kỹ Thuật Viên: Dừng Chủ Động & LOTO
-st.markdown("##### 🛠️ Trung Tâm Thao Tác Kỹ Thuật Viên (Dừng Chủ Động & Mở Khóa LOTO)")
+st.markdown("##### Thao tác bảo trì mô phỏng — không phải hệ thống an toàn được chứng nhận")
 act1, act2 = st.columns([1, 1])
-
 with act1:
-    st.markdown("**1. Dừng Máy Chủ Động (Planned Maintenance Stop)**")
-    st.caption("KTV dừng máy có kế hoạch (ghi nhận vào fact_downtime_events chỉ mất 3 phút thay vì 30 phút).")
-    if st.button("🛑 DỪNG MÁY CHỦ ĐỘNG ĐỂ BẢO TRÌ"):
+    st.markdown("**1. Dừng chủ động (mô phỏng)**")
+    st.caption("Ghi nhận sự kiện downtime liên kết với telemetry gần nhất nếu thao tác hoàn tất.")
+    if st.button("🛑 Dừng mô phỏng để bảo trì", disabled=is_red_state or st.session_state.get("maintenance_stop_latched", False)):
         plc_bridge.write_holding_register("LINE_01", PLCHoldingRegisters.REG_CURRENT_ACTUAL_SPEED, 0)
         plc_bridge.write_holding_register("LINE_01", PLCHoldingRegisters.REG_SAFETY_INTERLOCK, 1)
-        record_downtime_event("LINE_01", "PLANNED_PM", "KTV dừng máy chủ động thay thế phụ tùng theo cảnh báo Copilot", duration_mins=3.0)
-        append_shift_log(f"{datetime.now().strftime('%H:%M:%S')} - KTV dừng máy chủ động (Ghi nhận 3 phút planned downtime).")
-        st.success("Máy đã dừng an toàn!")
-        st.rerun()
+        try:
+            active_event_id = st.session_state.get("current_event_id")
+            if active_event_id:
+                active_fault = latest_frame.get("fault_mode", getattr(sim, "fault_mode", "CUTTER_WEAR"))
+                active_error = "E-204" if active_fault == "CUTTER_WEAR" else ("E-105" if active_fault == "CHILLER_OVERHEAT" else "E-302")
+                update_downtime_event(active_event_id, 3.0, "LINE_01", active_error, st.session_state.get("current_wo_id"))
+            else:
+                record_downtime_event("LINE_01", "PLANNED_PM", "KTV dừng mô phỏng để thay linh kiện", duration_mins=3.0)
+        except Exception as exc:
+            st.error(f"Không ghi được downtime; không báo thành công: {exc}")
+        else:
+            st.session_state["maintenance_stop_latched"] = True
+            append_shift_log(f"{datetime.now().strftime('%H:%M:%S')} - Dừng mô phỏng, downtime 3 phút đã ghi.")
+            st.success("Đã dừng mô phỏng và ghi nhận downtime vào SQLite.")
+            st.rerun()
 
 with act2:
-    st.markdown("**2. Xác Nhận Đã Thay Linh Kiện & Mở Khóa LOTO**")
+    st.markdown("**2. Xác nhận bảo trì & mở khóa LOTO mô phỏng**")
     t_sonotrode = latest_frame["ultrasonic_temp_c"]
-    safe_loto = (t_sonotrode <= 40.0)
-
-    if current_warehouse_stock <= 0:
-        st.error(f"🚨 **HẾT HÀNG TRONG KHO SAP (Tồn kho = {current_warehouse_stock})!** Bạn không thể thay linh kiện vì không có đồ mới trong kho. Hãy ấn nút '📥 Nhập Kho SAP' ở trên!")
-
+    safe_loto = t_sonotrode <= 40.0
+    if current_warehouse_stock <= 0 and not st.session_state.get("active_sap_slip"):
+        st.error(f"Catalog demo báo hết phụ tùng (tồn kho = {current_warehouse_stock}).")
     with st.form("loto_stochastic_form"):
-        ktv_name = st.text_input("Kỹ thuật viên thực hiện", value="Nguyễn Doãn Hoàng (KTV Ca 1)")
-        padlock = st.text_input("Mã khóa LOTO", value="PADLOCK-BH2-094")
-        confirm_ok = st.checkbox("Xác nhận: Đã hoàn tất thay thế linh kiện mới theo chỉ dẫn Copilot.")
-
-        btn_unlock = st.form_submit_button("🔓 XÁC NHẬN HOÀN TẤT & KHỞI ĐỘNG LẠI MÁY")
-
+        ktv_name = st.text_input("Kỹ thuật viên", value="Nguyễn Doãn Hoàng (KTV Ca 1)")
+        padlock = st.text_input("Mã khóa demo", value="PADLOCK-DEMO-001")
+        confirm_ok = st.checkbox("Xác nhận hoàn tất thay thế linh kiện trong kịch bản mô phỏng.")
+        btn_unlock = st.form_submit_button("Xác nhận hoàn tất & khởi động lại (mô phỏng)")
         if btn_unlock:
-            if current_warehouse_stock <= 0:
-                st.error("❌ TỪ CHỐI THỰC THI: Kho SAP không còn phụ tùng thay thế! Không thể hoàn tất bảo trì khi không có linh kiện mới!")
+            if not (is_red_state or st.session_state.get("maintenance_stop_latched", False) or st.session_state.get("current_wo_id")):
+                st.error("Chỉ có thể hoàn tất bảo trì sau khi mô phỏng đã dừng hoặc có Work Order đang mở.")
+            elif current_warehouse_stock <= 0 and not st.session_state.get("active_sap_slip"):
+                st.error("Bị từ chối trong demo: catalog không có phụ tùng thay thế.")
             elif not confirm_ok:
-                st.error("CẢNH BÁO: Phải xác nhận đã hoàn tất thay thế linh kiện!")
+                st.error("Cần xác nhận đã hoàn tất thay thế linh kiện.")
             elif not safe_loto:
-                st.error(f"TỪ CHỐI AN TOÀN EHS: Nhiệt độ đầu hàn {t_sonotrode}°C > 40°C! Nguy cơ bỏng nhiệt. Chờ Chiller giải nhiệt!")
+                st.error(f"Cổng nhiệt demo từ chối: {t_sonotrode:.1f}°C > 40°C.")
             else:
-                sim.replace_part_and_reset()
-                approve_loto_unlock("LINE_01", ktv_name, padlock)
-
-                close_app_work_order(st.session_state.get("current_wo_id"), ktv_name)
-
-                st.session_state["active_sap_slip"] = None
-                st.session_state["derate_seconds_count"] = 0
-                st.session_state["detector"] = DegradationDetector(window_size=15)
-                append_shift_log(
-                    f"{datetime.now().strftime('%H:%M:%S')} - 🎉 KTV {ktv_name} hoàn tất bảo trì. Đóng phiếu Work Order. Mở khóa LOTO -> Máy trở lại 24.000 cph!"
-                )
-                st.success("🎉 BẢO TRÌ THÀNH CÔNG! Đã đóng phiếu Work Order. Dây chuyền trở lại định mức 24.000 cph màu XANH!")
-                st.rerun()
+                try:
+                    if st.session_state.get("red_latched", False) and not st.session_state.get("red_event_persisted", False):
+                        retry_fault = latest_frame.get("fault_mode", getattr(sim, "fault_mode", "CUTTER_WEAR"))
+                        retry_err = "E-204" if retry_fault == "CUTTER_WEAR" else ("E-105" if retry_fault == "CHILLER_OVERHEAT" else "E-302")
+                        retry_event_id = st.session_state.get("current_event_id")
+                        retry_wo_id = st.session_state.get("current_wo_id")
+                        if retry_event_id:
+                            if not retry_wo_id:
+                                retry_wo_id, _ = create_app_work_order(
+                                    "LINE_01", retry_err, "[RED INCIDENT RETRY]: Khôi phục Work Order cho event hiện có.", existing_event_id=retry_event_id
+                                )
+                                st.session_state["current_wo_id"] = retry_wo_id
+                            update_downtime_event(retry_event_id, 30.0, "LINE_01", retry_err, retry_wo_id)
+                        else:
+                            retry_wo_id, retry_event_id = create_app_work_order(
+                                "LINE_01", retry_err, "[RED INCIDENT RETRY]: Khôi phục ghi nhận sự cố RED.", downtime_duration_minutes=30.0
+                            )
+                            st.session_state["current_wo_id"] = retry_wo_id
+                            st.session_state["current_event_id"] = retry_event_id
+                        st.session_state["red_event_persisted"] = True
+                        append_shift_log(f"{datetime.now().strftime('%H:%M:%S')} - Đã khôi phục ghi nhận RED trước khi mở khóa.")
+                    loto_result = approve_loto_unlock("LINE_01", ktv_name, padlock)
+                    if loto_result.get("status") != "SUCCESS":
+                        raise RuntimeError(loto_result.get("message", loto_result.get("reason", "LOTO unlock was not confirmed")))
+                    if st.session_state.get("current_wo_id"):
+                        close_app_work_order(st.session_state["current_wo_id"], ktv_name)
+                except Exception as exc:
+                    st.error(f"Không thể xác nhận đóng Work Order/mở khóa: {exc}")
+                else:
+                    sim.replace_part_and_reset()
+                    st.session_state["active_sap_slip"] = None
+                    st.session_state["current_wo_id"] = None
+                    st.session_state["current_event_id"] = None
+                    st.session_state["red_latched"] = False
+                    st.session_state["red_event_persisted"] = False
+                    st.session_state["maintenance_stop_latched"] = False
+                    st.session_state["derate_seconds_count"] = 0
+                    st.session_state["detector"] = DegradationDetector(window_size=15)
+                    try:
+                        st.session_state["latest_frame"] = sim.step()
+                    except sqlite3.Error as exc:
+                        st.error(f"Máy mô phỏng đã được reset trong bộ nhớ nhưng frame không lưu được: {exc}")
+                        st.stop()
+                    append_shift_log(f"{datetime.now().strftime('%H:%M:%S')} - KTV {ktv_name} hoàn tất bảo trì mô phỏng; khóa {padlock}.")
+                    st.success("Đã hoàn tất chu trình bảo trì mô phỏng.")
+                    st.rerun()
 
 st.markdown("---")
-
-# 5. Nhật Ký Ca Trực
-with st.expander("📜 Nhật Ký Sự Cố & Thao Tác Ca Trực (Shift Audit Trail)", expanded=True):
+with st.expander("📜 Nhật ký sự cố & thao tác ca trực", expanded=True):
     logs_to_show = st.session_state.get("shift_log", [])
     for item in reversed(logs_to_show[-8:]):
         st.markdown(f"- `{item}`")
